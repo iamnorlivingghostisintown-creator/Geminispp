@@ -1,0 +1,2301 @@
+import React, { useState, useRef, useMemo, useEffect } from 'react';
+import { extractFromText, extractFromJSON, scoreEntry, getSentiment, detectTopics, detectPeopleInText, Entry } from './utils';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
+import { FixedSizeList } from 'react-window';
+import { get, set, keys, del } from 'idb-keyval';
+import { 
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, 
+  PieChart, Pie, Cell, BarChart, Bar, Legend, AreaChart, Area
+} from 'recharts';
+import { motion, AnimatePresence } from 'motion/react';
+import { 
+  Search, Trash2, Download, Brain, MessageSquare, Filter, 
+  BarChart3, LayoutGrid, Clock, Users, Tag, Sparkles,
+  ChevronRight, ChevronDown, AlertCircle, CheckCircle2, GitCompare, EyeOff,
+  History, FileText, X
+} from 'lucide-react';
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+const safeJsonParse = (text: string | undefined): any => {
+  if (!text) return {};
+  try {
+    // Remove potential markdown code blocks
+    const cleaned = text.replace(/```json\n?|```\n?/g, '').trim();
+    return JSON.parse(cleaned);
+  } catch (e) {
+    console.error("JSON Parse error:", e, "Raw text:", text);
+    // Try to find the first '{' or '[' and last '}' or ']'
+    try {
+      const startObj = text.indexOf('{');
+      const startArr = text.indexOf('[');
+      const start = (startObj !== -1 && (startArr === -1 || startObj < startArr)) ? startObj : startArr;
+      
+      const endObj = text.lastIndexOf('}');
+      const endArr = text.lastIndexOf(']');
+      const end = (endObj !== -1 && (endArr === -1 || endObj > endArr)) ? endObj : endArr;
+
+      if (start !== -1 && end !== -1) {
+        return JSON.parse(text.substring(start, end + 1));
+      }
+    } catch (e2) {
+      console.error("Secondary JSON Parse error:", e2);
+    }
+    return {};
+  }
+};
+
+const highlightKeywords = (text: string, keywords: string[]) => {
+  if (!keywords || keywords.length === 0) return text;
+  const safeKeywords = keywords.map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  const pattern = new RegExp(`(${safeKeywords.join('|')})`, 'gi');
+  const parts = text.split(pattern);
+  return parts.map((part, i) => 
+    keywords.some(k => k.toLowerCase() === part.toLowerCase()) 
+      ? <mark key={i} className="bg-[var(--amber)] text-black px-0.5 rounded-sm not-italic font-bold">{part}</mark> 
+      : part
+  );
+};
+
+const renderHighlightedText = (text: string, highlight: string | undefined, colorClass: string) => {
+  if (!highlight || !text.toLowerCase().includes(highlight.toLowerCase())) return text;
+  
+  const safeHighlight = highlight.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(`(${safeHighlight})`, 'gi');
+  const parts = text.split(pattern);
+  
+  return parts.map((part, i) => 
+    part.toLowerCase() === highlight.toLowerCase() 
+      ? <mark key={i} className={`${colorClass} text-black px-1 rounded-sm not-italic font-bold shadow-sm`}>{part}</mark> 
+      : part
+  );
+};
+
+// Entry type is imported from utils.ts
+
+type AIBatch = {
+  id: number;
+  chunk: Entry[];
+  status: 'pending' | 'processing' | 'success' | 'error';
+  error?: string;
+};
+
+export default function App() {
+  const [activeTab, setActiveTab] = useState('instant');
+  const [entries, setEntries] = useState<Entry[]>([]);
+  const [aiStories, setAiStories] = useState<any[]>([]);
+  const [aiRejectedStories, setAiRejectedStories] = useState<any[]>([]);
+  const [aiBatches, setAiBatches] = useState<AIBatch[]>([]);
+  const [chatHistory, setChatHistory] = useState<any[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [isChatLoading, setIsChatLoading] = useState(false);
+  const [isAiLoading, setIsAiLoading] = useState(false);
+  const [aiProgress, setAiProgress] = useState('');
+  const [aiSummary, setAiSummary] = useState<string | null>(null);
+  const [isSummarizing, setIsSummarizing] = useState(false);
+  
+  const [minScore, setMinScore] = useState(0);
+  const [removeAI, setRemoveAI] = useState(true);
+  
+  const [comparisonEntries, setComparisonEntries] = useState<Entry[]>([]);
+  const [comparisonResults, setComparisonResults] = useState<string | null>(null);
+  const [isComparing, setIsComparing] = useState(false);
+  const [comparisonBatches, setComparisonBatches] = useState<any[]>([]);
+  const [comparisonFindings, setComparisonFindings] = useState<{
+    entry: Entry, 
+    reason: string, 
+    newFileQuote?: string, 
+    connectionReason?: string, 
+    importanceReason?: string,
+    sourceHighlight?: string,
+    newFileHighlight?: string,
+    newFileFullMessage?: string
+  }[]>([]);
+  const [comparisonThoughts, setComparisonThoughts] = useState<string[]>([]);
+  
+  const [removeShort, setRemoveShort] = useState(true);
+  const [minChars, setMinChars] = useState(50);
+  
+  const [excludedWords, setExcludedWords] = useState<string[]>(['es', 'lo', 'jax', 'ashe']);
+  const [exclInput, setExclInput] = useState('');
+  const [selectedKeyword, setSelectedKeyword] = useState<string | null>(null);
+
+  const [fileHistory, setFileHistory] = useState<{name: string, timestamp: number, type: 'source' | 'compare', size: number}[]>([]);
+  const [isHistoryLoading, setIsHistoryLoading] = useState(false);
+
+  useEffect(() => {
+    refreshHistory();
+  }, []);
+
+  const refreshHistory = async () => {
+    try {
+      const meta = await get('file_history_metadata');
+      if (meta && Array.isArray(meta)) {
+        setFileHistory(meta.sort((a, b) => b.timestamp - a.timestamp));
+        return;
+      }
+      
+      // Fallback: Rebuild metadata from all possible history keys
+      const allKeys = await keys();
+      const items = await Promise.all(allKeys.map(async k => {
+        if (typeof k !== 'string') return null;
+        
+        try {
+          if (k.startsWith('file_hist_content_')) {
+            // New format: file_hist_content_{type}_{timestamp}_{name}
+            const parts = k.replace('file_hist_content_', '').split('_');
+            if (parts.length < 3) return null;
+            const type = parts[0] as 'source' | 'compare';
+            const timestamp = parseInt(parts[1]);
+            const name = parts.slice(2).join('_');
+            return { key: k, name, timestamp, type, size: 0 };
+          } else if (k.startsWith('file_hist_') && !k.startsWith('file_history_')) {
+            // Old format: data is an object
+            const data = await get(k);
+            if (!data || typeof data !== 'object') return null;
+            return {
+              key: k,
+              name: data.name || 'Unknown File',
+              timestamp: data.timestamp || Date.now(),
+              type: data.type || 'source',
+              size: data.size || 0
+            };
+          }
+        } catch (e) {
+          return null;
+        }
+        return null;
+      }));
+
+      const validItems = items.filter((i): i is NonNullable<typeof i> => i !== null).sort((a, b) => b.timestamp - a.timestamp);
+      setFileHistory(validItems);
+      if (validItems.length > 0) {
+        await set('file_history_metadata', validItems);
+      }
+    } catch (e) {
+      console.error("Failed to load history", e);
+    }
+  };
+
+  const saveToHistory = async (file: File, type: 'source' | 'compare') => {
+    const text = await file.text();
+    const timestamp = Date.now();
+    const id = `${type}_${timestamp}_${file.name}`;
+    const contentKey = `file_hist_content_${id}`;
+    
+    // Store content separately
+    await set(contentKey, text);
+    
+    // Update metadata
+    const newMeta = {
+      key: contentKey,
+      name: file.name,
+      timestamp,
+      type,
+      size: file.size
+    };
+    
+    const currentMeta = await get('file_history_metadata') || [];
+    const updatedMeta = [newMeta, ...currentMeta.filter((m: any) => m.name !== file.name || m.type !== type)].slice(0, 50); // Keep last 50
+    await set('file_history_metadata', updatedMeta);
+  };
+
+  const loadFromHistory = async (key: string) => {
+    setIsHistoryLoading(true);
+    try {
+      const data = await get(key);
+      if (!data) {
+        throw new Error("File content not found in history");
+      }
+      
+      // Determine content and metadata
+      let content: string;
+      let fileName: string;
+      let fileType: 'source' | 'compare';
+
+      if (typeof data === 'object' && data.content) {
+        // Old format
+        content = data.content;
+        fileName = data.name || "Restored File";
+        fileType = data.type || 'source';
+      } else {
+        // New format (data is the string content)
+        content = data as string;
+        const meta = await get('file_history_metadata') || [];
+        const itemMeta = meta.find((m: any) => m.key === key);
+        fileName = itemMeta?.name || "Restored File";
+        fileType = itemMeta?.type || 'source';
+      }
+      
+      const pseudoFile = {
+        name: fileName,
+        text: async () => content
+      };
+
+      if (fileType === 'compare') {
+        await handleComparisonFiles([pseudoFile as any]);
+      } else {
+        await handleFiles([pseudoFile as any]);
+      }
+      showNotification(`Loaded ${fileName} from history`, "success");
+    } catch (e) {
+      console.error(e);
+      showNotification("Failed to load file from history", "error");
+    } finally {
+      setIsHistoryLoading(false);
+    }
+  };
+
+  const deleteFromHistory = async (key: string) => {
+    await del(key);
+    const currentMeta = await get('file_history_metadata') || [];
+    const updatedMeta = currentMeta.filter((m: any) => m.key !== key);
+    await set('file_history_metadata', updatedMeta);
+    refreshHistory();
+    showNotification("Removed from history", "info");
+  };
+
+  const clearAllHistory = async () => {
+    try {
+      const allKeys = await keys();
+      const historyKeys = allKeys.filter(k => typeof k === 'string' && k.startsWith('file_hist_'));
+      await Promise.all(historyKeys.map(k => del(k)));
+      await del('file_history_metadata');
+      refreshHistory();
+      showNotification("All history cleared", "success");
+    } catch (e) {
+      console.error(e);
+      showNotification("Failed to clear history", "error");
+    }
+  };
+
+  const loadAllFromHistory = async (type: 'source' | 'compare') => {
+    setIsHistoryLoading(true);
+    try {
+      const meta = await get('file_history_metadata') || [];
+      const filteredMeta = meta.filter((m: any) => m.type === type);
+      
+      if (filteredMeta.length === 0) {
+        // Fallback to scanning keys if metadata is empty (maybe old format or first run)
+        const allKeys = await keys();
+        const oldPrefix = `file_hist_${type}_`;
+        const historyKeys = allKeys.filter(k => typeof k === 'string' && k.startsWith(oldPrefix));
+        
+        if (historyKeys.length === 0) {
+          showNotification("No history files found to load", "info");
+          return;
+        }
+        
+        const allData = await Promise.all(historyKeys.map(k => get(k)));
+        const validData = allData.filter(d => d && d.content);
+        
+        if (validData.length === 0) {
+          showNotification("No history files found to load", "info");
+          return;
+        }
+
+        const pseudoFiles = validData.map(d => ({
+          name: d.name,
+          text: async () => d.content
+        }));
+
+        if (type === 'source') await handleFiles(pseudoFiles as any);
+        else await handleComparisonFiles(pseudoFiles as any);
+        
+        showNotification(`Loaded ${validData.length} files from history`, "success");
+        return;
+      }
+
+      // Load using metadata (new format)
+      const pseudoFiles = await Promise.all(filteredMeta.map(async (m: any) => {
+        const data = await get(m.key);
+        if (!data) return null;
+        
+        // Handle both formats just in case metadata points to an old object
+        const text = (typeof data === 'object' && data.content) ? data.content : data;
+        
+        return {
+          name: m.name,
+          text: async () => text
+        };
+      }));
+
+      const validPseudoFiles = pseudoFiles.filter((f): f is NonNullable<typeof f> => f !== null);
+
+      if (validPseudoFiles.length === 0) {
+        showNotification("No history files found to load", "info");
+        return;
+      }
+
+      if (type === 'source') await handleFiles(validPseudoFiles as any);
+      else await handleComparisonFiles(validPseudoFiles as any);
+      
+      showNotification(`Loaded ${validPseudoFiles.length} files from history`, "success");
+    } catch (e) {
+      console.error(e);
+      showNotification("Failed to load all files from history", "error");
+    } finally {
+      setIsHistoryLoading(false);
+    }
+  };
+
+  const [aiTotalProcessed, setAiTotalProcessed] = useState(0);
+  const [aiProcessedSoFar, setAiProcessedSoFar] = useState(0);
+  const [notification, setNotification] = useState<{msg: string, type: 'info' | 'error' | 'success'} | null>(null);
+  const [confirmState, setConfirmState] = useState<Record<string, boolean>>({});
+
+  // Pre-compile exclusion regexes
+  const exclusionRegexes = useMemo(() => {
+    return excludedWords.map(w => {
+      const safe = w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return new RegExp('(^|[^a-zA-Z0-9_])' + safe + '(?![a-zA-Z0-9_])', 'i');
+    });
+  }, [excludedWords]);
+
+  const toggleHide = (index: number) => {
+    setEntries(prev => {
+      const next = [...prev];
+      next[index] = { ...next[index], isHidden: !next[index].isHidden };
+      return next;
+    });
+  };
+
+  const filteredData = useMemo(() => {
+    const kept: Entry[] = [];
+    const removed: Entry[] = [];
+
+    for (let i = 0; i < entries.length; i++) {
+      const e = { ...entries[i] };
+      let isKept = true;
+
+      if (e.isHidden) {
+        isKept = false;
+        e.removalReason = 'Manual';
+      } else if (e.score < minScore) {
+        isKept = false;
+        e.removalReason = 'Low-Score';
+      } else if (removeAI && e.isAssistant) {
+        isKept = false;
+        e.removalReason = 'AI-Reply';
+      } else if (removeShort && e.charCount < minChars) {
+        isKept = false;
+        e.removalReason = 'Short';
+      } else {
+        const matches: string[] = [];
+        for (let j = 0; j < exclusionRegexes.length; j++) {
+          if (exclusionRegexes[j].test(e.text)) {
+            isKept = false;
+            e.removalReason = 'Keyword';
+            matches.push(excludedWords[j]);
+          }
+        }
+        if (matches.length > 0) e.matchedKeywords = matches;
+      }
+
+      if (isKept) kept.push(e);
+      else removed.push(e);
+    }
+
+    return { kept, removed };
+  }, [entries, minScore, removeAI, removeShort, minChars, exclusionRegexes, excludedWords]);
+
+  const overallStats = useMemo(() => {
+    const { kept } = filteredData;
+    const total = entries.length;
+    const avgScore = kept.length ? Math.round(kept.reduce((a, e) => a + e.score, 0) / kept.length) : 0;
+    const words = Math.round(kept.reduce((a, e) => a + e.charCount, 0) / 5);
+    const wordsStr = words > 999 ? (words / 1000).toFixed(1) + 'k' : words.toString();
+    const peopleSet = new Set<string>();
+    for (const e of kept) {
+      for (const p of e.people) peopleSet.add(p);
+    }
+    
+    return { kept: kept.length, total, avgScore, words: wordsStr, people: peopleSet.size };
+  }, [entries.length, filteredData]);
+
+  const filteredEntries = useMemo(() => {
+    return [...filteredData.kept].sort((a, b) => b.score - a.score);
+  }, [filteredData.kept]);
+
+  const removedEntries = useMemo(() => {
+    let base = [...filteredData.removed].sort((a, b) => b.score - a.score);
+    if (selectedKeyword) {
+      return base.filter(e => e.matchedKeywords?.includes(selectedKeyword));
+    }
+    return base;
+  }, [filteredData.removed, selectedKeyword]);
+
+  const activeKeywords = useMemo(() => {
+    const counts: Record<string, number> = {};
+    filteredData.removed.forEach(e => {
+      if (e.removalReason === 'Keyword' && e.matchedKeywords) {
+        e.matchedKeywords.forEach(k => {
+          counts[k] = (counts[k] || 0) + 1;
+        });
+      }
+    });
+    return Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  }, [filteredData.removed]);
+
+  const generateSummary = async () => {
+    if (entries.length === 0) return;
+    setIsSummarizing(true);
+    
+    try {
+      const sample = filteredEntries.slice(0, 20).map(e => e.text).join('\n\n---\n\n');
+      const prompt = `Summarize this personal archive. 
+      Identify:
+      1. Time period covered (if possible)
+      2. Key life events or recurring themes
+      3. Overall emotional tone
+      4. A "TL;DR" of who this person is based on these snippets.
+      
+      Keep it under 250 words. Use bullet points.
+      
+      Archive Snippets:
+      ${sample}`;
+      
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: prompt
+      });
+      
+      setAiSummary(response.text);
+    } catch (e) {
+      console.error(e);
+      showNotification("Failed to generate summary.", "error");
+    } finally {
+      setIsSummarizing(false);
+    }
+  };
+
+  const Dashboard = () => {
+    const topicData = useMemo(() => {
+      const counts: Record<string, number> = {};
+      filteredEntries.forEach(e => {
+        counts[e.topic] = (counts[e.topic] || 0) + 1;
+      });
+      return Object.entries(counts).map(([name, value]) => ({ name, value }));
+    }, [filteredEntries]);
+
+    const sentimentData = useMemo(() => {
+      const counts: Record<string, number> = { positive: 0, neutral: 0, negative: 0, mixed: 0 };
+      filteredEntries.forEach(e => {
+        counts[e.sentiment]++;
+      });
+      return Object.entries(counts).map(([name, value]) => ({ name, value }));
+    }, [filteredEntries]);
+
+    const timelineData = useMemo(() => {
+      if (!entries.some(e => e.timestamp)) return [];
+      const sorted = [...filteredEntries].filter(e => e.timestamp).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      const buckets: Record<string, { count: number, score: number }> = {};
+      
+      sorted.forEach(e => {
+        try {
+          const d = new Date(e.timestamp!);
+          if (isNaN(d.getTime())) return;
+          const date = d.toISOString().slice(0, 7); // YYYY-MM
+          if (!buckets[date]) buckets[date] = { count: 0, score: 0 };
+          buckets[date].count++;
+          buckets[date].score += e.score;
+        } catch (err) {
+          console.error("Invalid date in timeline", err);
+        }
+      });
+      
+      return Object.entries(buckets).map(([date, data]) => ({
+        date,
+        count: data.count,
+        avgScore: Math.round(data.score / data.count)
+      }));
+    }, [filteredEntries]);
+
+    const COLORS = ['#e8a020', '#2cc8a8', '#a070e0', '#4090e0', '#e05555', '#48c878'];
+
+    return (
+      <div className="space-y-6 animate-in fade-in duration-500">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          {/* Topic Distribution */}
+          <div className="bg-[var(--s1)] border border-[var(--border)] rounded-xl p-6">
+            <h3 className="text-[10px] tracking-[3px] text-[var(--muted)] uppercase mb-6 flex items-center gap-2">
+              <Tag className="w-3 h-3 text-[var(--amber)]" /> Topic Heatmap
+            </h3>
+            <div className="h-[400px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie
+                    data={topicData}
+                    cx="50%"
+                    cy="50%"
+                    innerRadius={60}
+                    outerRadius={80}
+                    paddingAngle={5}
+                    dataKey="value"
+                  >
+                    {topicData.map((entry, index) => (
+                      <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+                    ))}
+                  </Pie>
+                  <Tooltip 
+                    contentStyle={{ backgroundColor: '#111009', border: '1px solid #2a241a', fontSize: '10px' }}
+                    itemStyle={{ color: '#ede8df' }}
+                  />
+                  <Legend wrapperStyle={{ fontSize: '10px', paddingTop: '20px' }} />
+                </PieChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          {/* Sentiment Breakdown */}
+          <div className="bg-[var(--s1)] border border-[var(--border)] rounded-xl p-6">
+            <h3 className="text-[10px] tracking-[3px] text-[var(--muted)] uppercase mb-6 flex items-center gap-2">
+              <Sparkles className="w-3 h-3 text-[var(--cyan)]" /> Sentiment Vibe
+            </h3>
+            <div className="h-[400px]">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={sentimentData}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#2a241a" vertical={false} />
+                  <XAxis dataKey="name" stroke="#685e50" fontSize={10} tickLine={false} axisLine={false} />
+                  <YAxis stroke="#685e50" fontSize={10} tickLine={false} axisLine={false} />
+                  <Tooltip 
+                    cursor={{ fill: 'rgba(232,160,32,0.05)' }}
+                    contentStyle={{ backgroundColor: '#111009', border: '1px solid #2a241a', fontSize: '10px' }}
+                  />
+                  <Bar dataKey="value" radius={[4, 4, 0, 0]}>
+                    {sentimentData.map((entry, index) => (
+                      <Cell key={`cell-${index}`} fill={entry.name === 'positive' ? '#48c878' : entry.name === 'negative' ? '#e05555' : '#4090e0'} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          {/* Timeline */}
+          {timelineData.length > 0 && (
+            <div className="bg-[var(--s1)] border border-[var(--border)] rounded-xl p-6 md:col-span-2">
+              <h3 className="text-[10px] tracking-[3px] text-[var(--muted)] uppercase mb-6 flex items-center gap-2">
+                <Clock className="w-3 h-3 text-[var(--purple)]" /> Activity Timeline
+              </h3>
+              <div className="h-[400px]">
+                <ResponsiveContainer width="100%" height="100%">
+                  <AreaChart data={timelineData}>
+                    <defs>
+                      <linearGradient id="colorCount" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor="#e8a020" stopOpacity={0.3}/>
+                        <stop offset="95%" stopColor="#e8a020" stopOpacity={0}/>
+                      </linearGradient>
+                    </defs>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#2a241a" vertical={false} />
+                    <XAxis dataKey="date" stroke="#685e50" fontSize={10} tickLine={false} axisLine={false} />
+                    <YAxis stroke="#685e50" fontSize={10} tickLine={false} axisLine={false} />
+                    <Tooltip 
+                      contentStyle={{ backgroundColor: '#111009', border: '1px solid #2a241a', fontSize: '10px' }}
+                    />
+                    <Area type="monotone" dataKey="count" stroke="#e8a020" fillOpacity={1} fill="url(#colorCount)" />
+                    <Line type="monotone" dataKey="avgScore" stroke="#2cc8a8" dot={false} strokeWidth={2} />
+                  </AreaChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  const MessageRow = ({ index, style, data }: { index: number, style: React.CSSProperties, data: Entry[] }) => {
+    const e = data[index];
+    const originalIndex = entries.findIndex(item => item === e);
+    
+    return (
+      <div style={style} className="px-4">
+        <div className="bg-[var(--s1)] border border-[var(--border)] rounded-lg p-4 mb-3 hover:border-[var(--amber)] transition-all group relative overflow-hidden">
+          <div className="flex items-center gap-2 text-[9px] tracking-[1px] text-[var(--muted)] mb-2">
+            <span 
+              className={`px-2 py-0.5 rounded font-bold uppercase text-[8px] ${
+                e.sentiment === 'positive' ? 'bg-[rgba(72,200,120,0.1)] text-[var(--green)]' :
+                e.sentiment === 'negative' ? 'bg-[rgba(224,85,85,0.1)] text-[var(--red)]' :
+                'bg-[rgba(64,144,224,0.1)] text-[var(--blue)]'
+              }`}
+            >
+              {e.sentiment}
+            </span>
+            <span 
+              className="px-2 py-0.5 bg-[var(--dim)] text-[var(--text)] rounded uppercase text-[8px] font-bold"
+            >
+              {e.topic}
+            </span>
+            <span className="ml-auto flex items-center gap-1">
+              <Brain className="w-3 h-3 opacity-40" />
+              Score: <span className="text-[var(--amber)] font-bold">{e.score}</span>
+            </span>
+            <button 
+              onClick={() => toggleHide(originalIndex)}
+              className="ml-2 p-1 hover:bg-[var(--dim)] rounded text-[var(--muted)] hover:text-[var(--red)] transition-colors opacity-0 group-hover:opacity-100"
+              title="Hide from Archive"
+            >
+              <EyeOff className="w-3 h-3" />
+            </button>
+          </div>
+          <div className="text-xs leading-relaxed text-[var(--text)] whitespace-pre-wrap line-clamp-3 group-hover:line-clamp-none transition-all">
+            {e.text}
+          </div>
+          {e.people.length > 0 && (
+            <div className="mt-3 flex flex-wrap gap-1.5">
+              {e.people.map(p => (
+                <span 
+                  key={p} 
+                  className="text-[8px] text-[var(--cyan)] bg-[rgba(44,200,168,0.05)] px-1.5 py-0.5 rounded border border-[rgba(44,200,168,0.1)]"
+                >
+                  @{p}
+                </span>
+              ))}
+            </div>
+          )}
+          <div className="absolute right-0 top-0 bottom-0 w-1 bg-gradient-to-b from-transparent via-[var(--amber)] to-transparent opacity-0 group-hover:opacity-100 transition-opacity"></div>
+        </div>
+      </div>
+    );
+  };
+  const runAIExtract = async (retryBatches?: AIBatch[]) => {
+    // Safety check: if called directly from onClick, retryBatches will be a React event object
+    const actualRetryBatches = Array.isArray(retryBatches) ? retryBatches : undefined;
+    
+    setIsAiLoading(true);
+    setAiProgress(actualRetryBatches ? 'Retrying failed chunks...' : 'Starting AI extraction...');
+    
+    let batchesToProcess: AIBatch[] = [];
+
+    if (actualRetryBatches) {
+      batchesToProcess = actualRetryBatches.map(b => ({ ...b, status: 'pending' as const }));
+      setAiBatches(prev => prev.map(b => {
+        const retry = batchesToProcess.find(rb => rb.id === b.id);
+        return retry ? { ...b, status: 'pending' as const } : b;
+      }));
+    } else {
+      const topEntries = filteredEntries;
+      if (topEntries.length === 0) {
+        showNotification("No entries to extract.", "error");
+        setIsAiLoading(false);
+        return;
+      }
+      
+      const BATCH_SIZE = 10;
+      const totalBatchesCount = Math.ceil(topEntries.length / BATCH_SIZE);
+      const newBatches: AIBatch[] = [];
+      for (let i = 0; i < totalBatchesCount; i++) {
+        newBatches.push({
+          id: i,
+          chunk: topEntries.slice(i * BATCH_SIZE, (i + 1) * BATCH_SIZE),
+          status: 'pending'
+        });
+      }
+      setAiBatches(newBatches);
+      batchesToProcess = newBatches;
+      setAiStories([]);
+      setAiRejectedStories([]);
+      setAiTotalProcessed(topEntries.length);
+      setAiProcessedSoFar(0);
+    }
+
+    const processBatch = async (batch: AIBatch, attempt = 1): Promise<void> => {
+      const MAX_RETRIES = 3;
+      setAiBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'processing', error: undefined } : b));
+      
+      const inputText = batch.chunk.map((e, idx) => `[ID: ${idx}]\n${e.text}`).join('\n\n---\n\n');
+      const prompt = `You are a helpful life curator. Extract genuine first-person life memories, personal stories, and explanations/corrections about life details.
+The input is already pre-filtered, but perform a final cleaning to find the "gems".
+
+CRITICAL: Keep entries that are personal stories, memories, or you explaining/correcting your own life details to the AI. These are valuable.
+REJECT ONLY: Purely technical talk (code, logs), generic AI instructions (e.g. "summarize this"), bot-like behavior (repetition), or completely non-personal noise.
+DO NOT REJECT stories just because they don't fit a specific theme or if they seem like "editing" or "correcting" info. If it's a personal memory or meaningful thought, KEEP IT. Even small nuances about life details are important.
+
+Return ONLY valid JSON:
+{
+  "stories": [
+    {"id": <ID from input>, "one_line": "<1 evocative sentence>", "theme": "<theme>", "emotion": "<emotion>", "timeframe": "<time>", "importance": 8}
+  ],
+  "rejected": [
+    {"id": <ID from input>, "reason": "<one-word: Technical|AI-Talk|Repetitive|Greeting|Instruction|Bot-Freeze|Noise>"}
+  ]
+}
+
+Only include entries in "stories" if importance >= 2. Everything else goes in "rejected".
+
+${inputText}`;
+
+      try {
+        const response = await ai.models.generateContent({
+          model: 'gemini-3-flash-preview',
+          contents: prompt,
+          config: { responseMimeType: 'application/json' }
+        });
+        
+        const parsed = safeJsonParse(response.text);
+        
+        if (parsed.stories) {
+          const enrichedStories = parsed.stories.map((s: any) => {
+            const originalEntry = batch.chunk[s.id];
+            return {
+              ...s,
+              text: originalEntry ? originalEntry.text : "Text not found"
+            };
+          }).filter((s: any) => s.text !== "Text not found");
+          
+          setAiStories(prev => [...prev, ...enrichedStories].sort((a: any, b: any) => b.importance - a.importance));
+        }
+
+        if (parsed.rejected) {
+          const enrichedRejected = parsed.rejected.map((r: any) => {
+            const originalEntry = batch.chunk[r.id];
+            return {
+              ...originalEntry,
+              aiReason: r.reason
+            };
+          }).filter((r: any) => r.text);
+          setAiRejectedStories(prev => [...prev, ...enrichedRejected]);
+        }
+
+        setAiBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'success' } : b));
+        setAiProcessedSoFar(prev => prev + batch.chunk.length);
+      } catch (e) {
+        if (attempt < MAX_RETRIES) {
+          console.warn(`Batch ${batch.id} failed (attempt ${attempt}). Retrying...`, e);
+          // Small delay before retry
+          await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+          return processBatch(batch, attempt + 1);
+        }
+        console.error(`Error in batch ${batch.id} after ${MAX_RETRIES} attempts:`, e);
+        setAiBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'error', error: String(e) } : b));
+      }
+    };
+
+    // Process batches with concurrency control
+    const concurrency = 3;
+    const queue = [...batchesToProcess];
+    const totalToProcess = batchesToProcess.length;
+    let completedCount = 0;
+
+    const workers = Array(Math.min(concurrency, queue.length)).fill(null).map(async () => {
+      while (queue.length > 0) {
+        const batch = queue.shift();
+        if (batch) {
+          await processBatch(batch);
+          completedCount++;
+          setAiProgress(`Processed ${completedCount} of ${totalToProcess} chunks...`);
+        }
+      }
+    });
+
+    await Promise.all(workers);
+    
+    setIsAiLoading(false);
+    setAiProgress('');
+  };
+
+  const runComparison = async (isRescan: any = false) => {
+    // Handle React event object if called directly from onClick
+    const actualIsRescan = typeof isRescan === 'boolean' ? isRescan : false;
+
+    if (comparisonEntries.length === 0 || filteredEntries.length === 0) return;
+    setIsComparing(true);
+    
+    if (!actualIsRescan) {
+      setComparisonResults(null);
+      setComparisonFindings([]);
+      setComparisonThoughts([]);
+    }
+    
+    const BATCH_SIZE = 15;
+    // If rescan, we only check entries that weren't already flagged as missing
+    const alreadyMissingTexts = new Set(comparisonFindings.map(f => f.entry.text));
+    const sourceEntries = actualIsRescan 
+      ? filteredEntries.filter(e => !alreadyMissingTexts.has(e.text)).slice(0, 150)
+      : filteredEntries.slice(0, 150);
+
+    if (sourceEntries.length === 0) {
+      showNotification("No more entries to scan.", "info");
+      setIsComparing(false);
+      return;
+    }
+
+    const totalBatchesCount = Math.ceil(sourceEntries.length / BATCH_SIZE);
+    
+    const newBatches = [];
+    for (let i = 0; i < totalBatchesCount; i++) {
+      newBatches.push({
+        id: i,
+        status: 'pending',
+        chunk: sourceEntries.slice(i * BATCH_SIZE, (i + 1) * BATCH_SIZE)
+      });
+    }
+    setComparisonBatches(newBatches);
+
+    const newFileText = comparisonEntries.slice(0, 100).map((e, idx) => `[NEW_ID: ${idx}]\n${e.text}`).join('\n---\n');
+    const currentBatchMissing: {
+      entry: Entry, 
+      reason: string, 
+      newFileQuote?: string, 
+      connectionReason?: string, 
+      importanceReason?: string,
+      sourceHighlight?: string,
+      newFileHighlight?: string,
+      newFileFullMessage?: string
+    }[] = [];
+
+    const processBatch = async (batch: any) => {
+      setComparisonBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'processing' } : b));
+      
+      const sourceText = batch.chunk.map((e: any, idx: number) => `[SOURCE_ID: ${idx}]\n${e.text}`).join('\n\n---\n\n');
+      const prompt = `You are a highly sophisticated life archivist. I have a "Source Archive" (my main stories) and a "New File" (the one I just uploaded).
+      Your goal is to perform a SEMANTIC GAP ANALYSIS with EXTREME DETAIL. 
+      
+      CRITICAL: Do NOT mark a story as missing just because the words are different. 
+      People often tell the same story using different vocabulary, different levels of detail, or from a slightly different perspective.
+      
+      A story is ONLY "Missing" if the CORE EVENT, the SPECIFIC FACT, or the UNIQUE EMOTIONAL NUANCE is completely absent from the New File.
+      
+      If the New File contains a version of the story that is:
+      - Paraphrased
+      - Summarized
+      - Mentioned briefly
+      ...then it is NOT missing. It is "Present".
+      
+      Only flag it as "Missing" if the New File has NO mention of this specific life event or if the New File's version is so vague that the original meaning is lost.
+      
+      ${actualIsRescan ? "This is a DEEP RESCAN. Look for very subtle nuances that might have been lost in translation between versions." : ""}
+
+      New File Content (Context):
+      ${newFileText}
+      
+      Source Archive Stories to check:
+      ${sourceText}
+      
+      For each "Source Archive Story", determine if it is fully captured in the "New File".
+      If it is MISSING or the "New File" only has a vague/incomplete version:
+      1. Identify the SOURCE_ID.
+      2. Provide a "reason": A VERY DETAILED explanation (2-3 sentences) of exactly what is missing or what nuance is lost.
+      3. Find the related message in the New File:
+         - "newFileId": The NEW_ID from the New File content that is most closely related to this story (even if it's a poor match). Use null if absolutely no mention exists.
+         - "newFileQuote": The specific phrase in that New File message that relates to the story.
+      4. Provide a "connectionReason": Detailed explanation of why the New File version is insufficient compared to the Source.
+      5. Provide an "importanceReason": Why this specific missing nuance matters for the user's life story.
+      6. Provide "sourceHighlight": The specific phrase in the Source Archive story that is the "heart" of what's missing.
+      
+      Return ONLY valid JSON:
+      {
+        "missing": [
+          {
+            "id": number, 
+            "reason": "string", 
+            "newFileId": number or null,
+            "newFileQuote": "string or null", 
+            "connectionReason": "string",
+            "importanceReason": "string",
+            "sourceHighlight": "string"
+          },
+          ...
+        ]
+      }
+      If everything is present, return an empty array for "missing".`;
+
+      try {
+        const response: any = await ai.models.generateContent({
+          model: 'gemini-3.1-pro-preview',
+          contents: prompt,
+          config: { 
+            responseMimeType: 'application/json',
+            thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH }
+          }
+        });
+        
+        if (response.thought) {
+          setComparisonThoughts(prev => [...prev, response.thought]);
+        }
+
+        const parsed = safeJsonParse(response.text);
+        if (parsed.missing && Array.isArray(parsed.missing)) {
+          const missingItems = parsed.missing
+            .map((m: any) => {
+              const entry = batch.chunk[m.id];
+              const newFileEntry = m.newFileId !== null ? comparisonEntries[m.newFileId] : null;
+              
+              return {
+                entry,
+                reason: m.reason || m.explanation,
+                newFileQuote: m.newFileQuote,
+                connectionReason: m.connectionReason,
+                importanceReason: m.importanceReason,
+                sourceHighlight: m.sourceHighlight,
+                newFileFullMessage: newFileEntry ? newFileEntry.text : undefined
+              };
+            })
+            .filter((m: any) => !!m.entry);
+          
+          currentBatchMissing.push(...missingItems);
+          setComparisonFindings(prev => [...prev, ...missingItems]);
+        }
+        
+        setComparisonBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'success' } : b));
+      } catch (e) {
+        console.error(e);
+        setComparisonBatches(prev => prev.map(b => b.id === batch.id ? { ...b, status: 'error' } : b));
+      }
+    };
+
+    // Process with concurrency
+    const queue = [...newBatches];
+    const workers = Array(3).fill(null).map(async () => {
+      while (queue.length > 0) {
+        const batch = queue.shift();
+        if (batch) await processBatch(batch);
+      }
+    });
+
+    await Promise.all(workers);
+    
+    // Update the final report based on ALL findings (accumulated)
+    const allFindings = actualIsRescan ? [...comparisonFindings, ...currentBatchMissing] : currentBatchMissing;
+
+    const finalReportPrompt = `Summarize these missing life stories into a cohesive "Gap Analysis Report". 
+    The goal is to tell the user what specific life themes or events from their main archive are missing in the new file they uploaded.
+    
+    ${actualIsRescan ? "Note: This is an updated report including new nuances found in a deep rescan." : ""}
+
+    Missing Stories Context (Sample of findings):
+    ${allFindings.slice(0, 40).map(m => `[Reason: ${m.reason}]\n${m.entry.text}`).join('\n---\n')}
+    
+    Format as a clean report with categories if possible.`;
+
+    try {
+      const finalResponse = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: finalReportPrompt
+      });
+      setComparisonResults(finalResponse.text);
+      showNotification(actualIsRescan ? "Deep rescan complete. Report updated." : "Comparison complete.", "success");
+    } catch (e) {
+      setComparisonResults("Gap analysis complete. See the full missing messages below.");
+    }
+    
+    setIsComparing(false);
+  };
+
+  const downloadComparisonReport = (isMd: boolean) => {
+    if (!comparisonResults && comparisonFindings.length === 0) return;
+    
+    // Calculate some analytics
+    const totalSource = filteredEntries.length;
+    const missingCount = comparisonFindings.length;
+    const coverage = totalSource > 0 ? Math.round(((totalSource - missingCount) / totalSource) * 100) : 0;
+    
+    const topicCounts: Record<string, number> = {};
+    comparisonFindings.forEach(f => {
+      topicCounts[f.entry.topic] = (topicCounts[f.entry.topic] || 0) + 1;
+    });
+    
+    let content = '';
+    if (isMd) {
+      content = '# Gap Analysis Report: Missing Life Information\n\n';
+      content += `*Generated on: ${new Date().toLocaleString()}*\n\n`;
+      
+      content += '## Analytics & Coverage\n';
+      content += `- **Total Archive Entries Checked:** ${totalSource}\n`;
+      content += `- **Missing Stories Identified:** ${missingCount}\n`;
+      content += `- **Estimated Coverage in New File:** ${coverage}%\n\n`;
+      
+      content += '### Missing Topics Breakdown\n';
+      Object.entries(topicCounts).forEach(([topic, count]) => {
+        content += `- **${topic}:** ${count} messages\n`;
+      });
+      content += '\n---\n\n';
+      
+      content += '## Summary Analysis\n\n';
+      content += (comparisonResults || 'No summary generated.') + '\n\n';
+      content += '---\n\n';
+      content += '## Source Evidence (Proof from Archive)\n\n';
+      comparisonFindings.forEach((f, i) => {
+        content += `### ${i+1}. Missing Detail: ${f.reason}\n\n`;
+        content += `**Source:** ${f.entry.source} · **Score:** ${f.entry.score} · **Topic:** ${f.entry.topic}\n\n`;
+        content += `> ${f.entry.text}\n\n---\n\n`;
+      });
+    } else {
+      content = 'GAP ANALYSIS REPORT: MISSING LIFE INFORMATION\n';
+      content += '='.repeat(60) + '\n';
+      content += `Generated on: ${new Date().toLocaleString()}\n\n`;
+      
+      content += 'ANALYTICS & COVERAGE\n';
+      content += `Total Archive Entries Checked: ${totalSource}\n`;
+      content += `Missing Stories Identified: ${missingCount}\n`;
+      content += `Estimated Coverage in New File: ${coverage}%\n\n`;
+      
+      content += 'MISSING TOPICS BREAKDOWN\n';
+      Object.entries(topicCounts).forEach(([topic, count]) => {
+        content += `- ${topic.toUpperCase()}: ${count}\n`;
+      });
+      content += '\n' + '-'.repeat(40) + '\n\n';
+      
+      content += 'SUMMARY ANALYSIS\n';
+      content += (comparisonResults || 'No summary generated.') + '\n\n';
+      content += 'SOURCE EVIDENCE (PROOF FROM ARCHIVE)\n';
+      content += '-'.repeat(40) + '\n\n';
+      comparisonFindings.forEach((f, i) => {
+        content += `${i+1}. REASON: ${f.reason.toUpperCase()}\n`;
+        content += `SOURCE: ${f.entry.source} | SCORE: ${f.entry.score} | TOPIC: ${f.entry.topic}\n\n`;
+        content += `${f.entry.text}\n\n`;
+        content += '─'.repeat(30) + '\n\n';
+      });
+    }
+
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `gap_analysis_${new Date().toISOString().slice(0,10)}.${isMd ? 'md' : 'txt'}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const handleComparisonFiles = async (files: FileList | File[]) => {
+    const fileList = Array.from(files);
+    if (fileList.length === 0) return;
+    
+    setIsComparing(true);
+    setComparisonResults(null);
+    let allNewEntries: Entry[] = [];
+    
+    for (const file of fileList) {
+      try {
+        if (file instanceof File) {
+          await saveToHistory(file, 'compare');
+        }
+        const text = await file.text();
+        let parsedEntries: any[] = [];
+        if (file.name.endsWith('.json')) {
+          try {
+            parsedEntries = extractFromJSON(safeJsonParse(text), file.name);
+          } catch {
+            parsedEntries = extractFromText(text, file.name);
+          }
+        } else {
+          parsedEntries = extractFromText(text, file.name);
+        }
+        
+        const processed = parsedEntries.map(e => ({
+          ...e,
+          score: scoreEntry(e.text),
+          sentiment: getSentiment(e.text),
+          topic: detectTopics(e.text),
+          people: detectPeopleInText(e.text),
+          textLower: e.text.toLowerCase()
+        }));
+        allNewEntries = allNewEntries.concat(processed);
+      } catch (e) {
+        console.error(e);
+      }
+    }
+    setComparisonEntries(allNewEntries);
+    refreshHistory();
+    
+    // We don't auto-run comparison here anymore to allow user to see the "Run" button and the progress blocks
+    setIsComparing(false);
+    showNotification(`Uploaded ${allNewEntries.length} entries for comparison. Ready to scan.`, "success");
+  };
+
+  const downloadInstantText = (isMd: boolean) => {
+    let content = '';
+    if (isMd) {
+      content = '# My Life Stories\n\n';
+      filteredEntries.forEach(e => {
+        content += `> Score: ${e.score} · Topic: ${e.topic} · Sentiment: ${e.sentiment}\n\n${e.text}\n\n---\n\n`;
+      });
+    } else {
+      content = 'MY LIFE STORIES\n' + '='.repeat(60) + '\n\n';
+      filteredEntries.forEach(e => {
+        content += `[Score: ${e.score} | Topic: ${e.topic} | Sentiment: ${e.sentiment}]\n${e.text}\n\n${'─'.repeat(40)}\n\n`;
+      });
+    }
+    
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `life_stories_${new Date().toISOString().slice(0,10)}.${isMd ? 'md' : 'txt'}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  function handleAddExcl() {
+    if (!exclInput.trim()) return;
+    setExcludedWords(prev => [...new Set([...prev, exclInput.trim().toLowerCase()])]);
+    setExclInput('');
+  }
+
+  const showNotification = (msg: string, type: 'info' | 'error' | 'success' = 'info') => {
+    setNotification({ msg, type });
+    setTimeout(() => setNotification(null), 5000);
+  };
+
+  const triggerConfirm = (id: string, callback: () => void) => {
+    if (confirmState[id]) {
+      callback();
+      setConfirmState(prev => ({ ...prev, [id]: false }));
+    } else {
+      setConfirmState(prev => ({ ...prev, [id]: true }));
+      setTimeout(() => setConfirmState(prev => ({ ...prev, [id]: false })), 3000);
+    }
+  };
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFiles = async (files: FileList | File[]) => {
+    const fileList = Array.from(files);
+    if (fileList.length === 0) return;
+    
+    setIsAiLoading(true);
+    let allNewProcessed: Entry[] = [];
+    
+    for (const file of fileList) {
+      try {
+        if (file instanceof File) {
+          await saveToHistory(file, 'source');
+        }
+        const text = await file.text();
+        let parsedEntries: any[] = [];
+        
+        if (file.name.endsWith('.json')) {
+          try {
+            parsedEntries = extractFromJSON(safeJsonParse(text), file.name);
+          } catch {
+            parsedEntries = extractFromText(text, file.name);
+          }
+        } else {
+          parsedEntries = extractFromText(text, file.name);
+        }
+        
+        const processedEntries = parsedEntries.map(e => ({
+          ...e,
+          score: scoreEntry(e.text),
+          sentiment: getSentiment(e.text),
+          topic: detectTopics(e.text),
+          people: detectPeopleInText(e.text),
+          textLower: e.text.toLowerCase()
+        }));
+
+        allNewProcessed = allNewProcessed.concat(processedEntries);
+      } catch (e) {
+        console.error("Failed to process file", e);
+        showNotification(`Failed to process ${file.name}: ${String(e)}`, "error");
+      }
+    }
+    
+    setEntries(prev => prev.concat(allNewProcessed));
+    refreshHistory();
+    setIsAiLoading(false);
+  };
+
+  const downloadAIText = (isMd: boolean) => {
+    let content = '';
+    if (isMd) {
+      content = '# My Life Stories — AI Extracted\n\n';
+      aiStories.forEach((s, i) => {
+        content += `## ${i+1}. ${s.one_line}\n\n*Theme: ${s.theme} · Emotion: ${s.emotion} · Timeframe: ${s.timeframe} · Importance: ${s.importance}/10*\n\n${s.text}\n\n---\n\n`;
+      });
+    } else {
+      content = 'MY LIFE STORIES — AI EXTRACTED\n' + '='.repeat(60) + '\n\n';
+      aiStories.forEach((s, i) => {
+        content += `[ ${i+1}. ${s.one_line.toUpperCase()} ]\nTheme: ${s.theme} | Emotion: ${s.emotion} | Importance: ${s.importance}/10\n\n${s.text}\n\n${'─'.repeat(40)}\n\n`;
+      });
+    }
+    
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `life_stories_ai_${new Date().toISOString().slice(0,10)}.${isMd ? 'md' : 'txt'}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const sendChat = async () => {
+    if (!chatInput.trim()) return;
+    
+    const msg = chatInput.trim();
+    setChatInput('');
+    setIsChatLoading(true);
+    
+    const newHistory = [...chatHistory, { role: 'user', content: msg }];
+    setChatHistory(newHistory);
+    
+    const ctx = (aiStories.length ? aiStories.slice(0, 10).map((s, i) => `[AI Story ${i+1}] ${s.text}`) : filteredEntries.slice(0, 18).map((e, i) => `[Story ${i+1}] ${e.text}`)).join('\n\n');
+    const sys = `You are an empathetic AI that has read someone's personal life stories.\n\nContext:\n${ctx}\n\nBe warm, specific, reference actual details. Speak directly to the person. Keep responses 100-200 words.`;
+    
+    try {
+      const response = await ai.models.generateContent({
+        model: 'gemini-3-flash-preview',
+        contents: newHistory.map(h => h.content).join('\n'),
+        config: { systemInstruction: sys }
+      });
+      
+      setChatHistory([...newHistory, { role: 'assistant', content: response.text }]);
+    } catch (e) {
+      console.error(e);
+      setChatHistory([...newHistory, { role: 'assistant', content: 'Error: Could not reach AI.' }]);
+    } finally {
+      setIsChatLoading(false);
+    }
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto px-5 pb-24 pt-12 relative z-10">
+      <div className="text-center mb-12">
+        <div className="font-serif italic text-4xl sm:text-6xl font-bold leading-none bg-gradient-to-br from-[#c87818] via-[var(--amber)] to-[var(--amber-g)] text-transparent bg-clip-text mb-2 tracking-tighter">
+          Life Extractor
+        </div>
+        <div className="text-[9px] tracking-[6px] text-[var(--muted)] uppercase mb-1">Deep Archive Edition</div>
+        <div className="text-[10px] tracking-[3px] text-[var(--cyan)] uppercase">⚡ Instant Intelligence · 🧠 AI Analysis · 💬 Archive Chat</div>
+      </div>
+
+      <div className="flex mb-8 border border-[var(--border)] rounded-xl overflow-hidden bg-[var(--s1)] shadow-2xl">
+        {['instant', 'dashboard', 'analysis', 'chat', 'compare', 'removed'].map(tab => (
+          <button
+            key={tab}
+            onClick={() => setActiveTab(tab)}
+            className={`flex-1 py-4 px-2 bg-transparent border-r border-[var(--border)] last:border-r-0 text-[var(--muted)] font-mono text-[9px] font-bold tracking-[2px] uppercase cursor-pointer transition-all flex flex-col items-center justify-center gap-2 hover:text-[var(--text)] hover:bg-[var(--s2)] ${activeTab === tab ? 'text-[var(--amber)] bg-[var(--amber-dim)]' : ''}`}
+          >
+            {tab === 'instant' && <LayoutGrid className="w-4 h-4" />}
+            {tab === 'dashboard' && <BarChart3 className="w-4 h-4" />}
+            {tab === 'analysis' && <Brain className="w-4 h-4" />}
+            {tab === 'chat' && <MessageSquare className="w-4 h-4" />}
+            {tab === 'compare' && <GitCompare className="w-4 h-4" />}
+            {tab === 'removed' && <Filter className="w-4 h-4" />}
+            
+            <span className="hidden sm:inline">
+              {tab === 'instant' ? 'Scan' : tab === 'dashboard' ? 'Insights' : tab === 'analysis' ? 'Stories' : tab === 'chat' ? 'Chat' : tab === 'compare' ? 'Compare' : 'Exclusions'}
+            </span>
+          </button>
+        ))}
+      </div>
+
+      {activeTab === 'dashboard' && <Dashboard />}
+
+      {activeTab === 'instant' && (
+        <div>
+          <input type="file" ref={fileInputRef} accept=".json,.txt" multiple className="hidden" onChange={e => e.target.files && handleFiles(e.target.files)} />
+          <div 
+            className="border-2 border-dashed border-[#2a241a] rounded p-12 text-center cursor-pointer transition-colors relative bg-[var(--s1)] mb-4 hover:border-[var(--amber)] hover:bg-[rgba(232,160,32,0.05)]"
+            onClick={() => fileInputRef.current?.click()}
+            onDragOver={e => e.preventDefault()}
+            onDrop={e => { e.preventDefault(); handleFiles(e.dataTransfer.files); }}
+          >
+            <span className="text-3xl mb-3 block">📂</span>
+            <div className="font-serif text-base text-[var(--text)] mb-1">Drop your chat archive here</div>
+            <p className="text-[10px] text-[var(--muted)] tracking-[1px] leading-loose">.json or .txt · multiple files OK<br/>Each entry is instantly scored by importance, sentiment & topic</p>
+          </div>
+
+          {/* File History Section */}
+          {fileHistory.filter(h => h.type === 'source').length > 0 && (
+            <div className="mb-8 bg-[var(--s1)] border border-[var(--border)] rounded-xl overflow-hidden">
+              <div className="px-4 py-3 border-b border-[var(--border)] flex items-center justify-between bg-[var(--s2)]">
+                <div className="text-[9px] tracking-[3px] text-[var(--muted)] uppercase font-bold flex items-center gap-2">
+                  <History className="w-3 h-3 text-[var(--amber)]" /> Recent Source Files
+                </div>
+                <div className="flex items-center gap-4">
+                  <button 
+                    onClick={() => loadAllFromHistory('source')}
+                    className="text-[8px] tracking-[2px] text-[var(--amber)] border border-[var(--amber)] px-2 py-1 rounded hover:bg-[var(--amber)] hover:text-black transition-all uppercase font-bold"
+                  >
+                    Load All as Source
+                  </button>
+                  <button 
+                    onClick={clearAllHistory}
+                    className="text-[8px] tracking-[2px] text-[var(--red)] border border-[var(--red)] px-2 py-1 rounded hover:bg-[var(--red)] hover:text-black transition-all uppercase font-bold"
+                  >
+                    Clear All History
+                  </button>
+                  <span className="text-[8px] text-[var(--muted)] uppercase tracking-[1px]">{fileHistory.filter(h => h.type === 'source').length} stored</span>
+                </div>
+              </div>
+              <div className="max-h-[200px] overflow-y-auto p-2 grid grid-cols-1 sm:grid-cols-2 gap-2 custom-scrollbar">
+                {fileHistory.filter(h => h.type === 'source').map((h: any) => (
+                  <div key={h.key} className="flex items-center gap-3 p-3 bg-[var(--bg)] border border-[var(--border)] rounded-lg hover:border-[var(--amber)] transition-all group">
+                    <FileText className="w-4 h-4 text-[var(--muted)] shrink-0" />
+                    <div className="flex-1 min-w-0 cursor-pointer" onClick={() => loadFromHistory(h.key)}>
+                      <div className="flex items-center gap-2">
+                        <div className="text-[10px] text-[var(--text)] truncate font-bold">{h.name}</div>
+                      </div>
+                      <div className="text-[8px] text-[var(--muted)] uppercase tracking-tighter">
+                        {new Date(h.timestamp).toLocaleDateString()} · {(h.size / 1024).toFixed(1)} KB
+                      </div>
+                    </div>
+                    <button 
+                      onClick={(e) => { e.stopPropagation(); deleteFromHistory(h.key); }}
+                      className="p-1 hover:bg-[var(--dim)] rounded text-[var(--muted)] hover:text-[var(--red)] transition-colors opacity-0 group-hover:opacity-100"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {entries.length > 0 && (
+            <div className="flex justify-center mb-8">
+              <button 
+                onClick={() => {
+                  setEntries([]);
+                  setAiStories([]);
+                  setAiRejectedStories([]);
+                  setChatHistory([]);
+                  showNotification("Archive cleared.", "success");
+                }}
+                className="text-[10px] px-6 py-2 rounded-full transition-all uppercase font-bold tracking-[2px] cursor-pointer border text-[var(--red)] border-[var(--red)] hover:bg-[var(--red)] hover:text-black"
+              >
+                🗑️ Clear All & Start Over
+              </button>
+            </div>
+          )}
+          
+          {entries.length > 0 && (
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8">
+              <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="bg-[var(--s1)] border border-[var(--border)] rounded-xl p-4 shadow-lg">
+                <div className="text-[8px] tracking-[2px] text-[var(--muted)] uppercase mb-1 flex items-center gap-1.5">
+                  <CheckCircle2 className="w-3 h-3 text-[var(--green)]" /> Kept
+                </div>
+                <div className="font-serif text-3xl text-[var(--amber)] leading-none">{overallStats.kept}</div>
+              </motion.div>
+              <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1 }} className="bg-[var(--s1)] border border-[var(--border)] rounded-xl p-4 shadow-lg">
+                <div className="text-[8px] tracking-[2px] text-[var(--muted)] uppercase mb-1 flex items-center gap-1.5">
+                  <LayoutGrid className="w-3 h-3 text-[var(--blue)]" /> Total
+                </div>
+                <div className="font-serif text-3xl text-[var(--amber)] leading-none">{overallStats.total}</div>
+              </motion.div>
+              <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2 }} className="bg-[var(--s1)] border border-[var(--border)] rounded-xl p-4 shadow-lg">
+                <div className="text-[8px] tracking-[2px] text-[var(--muted)] uppercase mb-1 flex items-center gap-1.5">
+                  <Brain className="w-3 h-3 text-[var(--purple)]" /> Avg Score
+                </div>
+                <div className="font-serif text-3xl text-[var(--amber)] leading-none">{overallStats.avgScore}</div>
+              </motion.div>
+              <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }} className="bg-[var(--s1)] border border-[var(--border)] rounded-xl p-4 shadow-lg">
+                <div className="text-[8px] tracking-[2px] text-[var(--muted)] uppercase mb-1 flex items-center gap-1.5">
+                  <Clock className="w-3 h-3 text-[var(--cyan)]" /> Words
+                </div>
+                <div className="font-serif text-3xl text-[var(--amber)] leading-none">{overallStats.words}</div>
+              </motion.div>
+              <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.4 }} className="bg-[var(--s1)] border border-[var(--border)] rounded-xl p-4 shadow-lg col-span-2 md:col-span-1">
+                <div className="text-[8px] tracking-[2px] text-[var(--muted)] uppercase mb-1 flex items-center gap-1.5">
+                  <Users className="w-3 h-3 text-[var(--amber)]" /> People
+                </div>
+                <div className="font-serif text-3xl text-[var(--amber)] leading-none">{overallStats.people}</div>
+              </motion.div>
+            </div>
+          )}
+
+          {entries.length > 0 && (
+            <>
+              <div className="bg-[var(--s1)] border border-[var(--border)] rounded-xl p-5 mb-4">
+                <div className="flex items-center gap-4 mt-4 pt-4">
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input type="checkbox" checked={removeAI} onChange={e => setRemoveAI(e.target.checked)} className="accent-[var(--amber)]" />
+                    <span className="text-[10px] text-[var(--muted)] uppercase tracking-wider">Hide AI Responses</span>
+                  </label>
+                  <div className="ml-auto flex items-center gap-3">
+                    <span className="text-[9px] text-[var(--muted)] uppercase tracking-widest">Min Score</span>
+                    <input type="range" min="0" max="100" value={minScore} onChange={e => setMinScore(Number(e.target.value))} className="w-32 accent-[var(--amber)]" />
+                    <span className="text-[10px] font-mono text-[var(--amber)] w-6">{minScore}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* AI Summary Section */}
+              <AnimatePresence>
+                {aiSummary && (
+                  <motion.div 
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: 'auto' }}
+                    exit={{ opacity: 0, height: 0 }}
+                    className="bg-[var(--amber-dim)] border border-[var(--amber)] rounded-xl p-6 mb-4 relative overflow-hidden"
+                  >
+                    <div className="absolute top-0 left-0 w-1 h-full bg-[var(--amber)]"></div>
+                    <div className="flex justify-between items-start mb-4">
+                      <h3 className="text-[10px] tracking-[3px] text-[var(--amber)] uppercase font-bold flex items-center gap-2">
+                        <Sparkles className="w-3 h-3" /> Archive Intelligence Summary
+                      </h3>
+                      <button onClick={() => setAiSummary(null)} className="text-[var(--muted)] hover:text-[var(--text)]">✕</button>
+                    </div>
+                    <div className="text-xs leading-relaxed text-[var(--text)] whitespace-pre-wrap font-serif italic">
+                      {aiSummary}
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
+              <div className="flex gap-3 mb-6">
+                <button 
+                  onClick={generateSummary}
+                  disabled={isSummarizing}
+                  className="flex-1 bg-[var(--s1)] border border-[var(--border)] text-[var(--text)] py-3 rounded-xl text-[10px] uppercase font-bold tracking-[2px] flex items-center justify-center gap-2 hover:bg-[var(--s2)] hover:border-[var(--amber)] transition-all disabled:opacity-50"
+                >
+                  <Brain className="w-4 h-4 text-[var(--amber)]" />
+                  {isSummarizing ? 'Analyzing...' : 'Generate AI Summary'}
+                </button>
+                <button 
+                  onClick={() => downloadInstantText(true)}
+                  className="bg-[var(--s1)] border border-[var(--border)] text-[var(--text)] px-6 py-3 rounded-xl text-[10px] uppercase font-bold tracking-[2px] flex items-center justify-center gap-2 hover:bg-[var(--s2)] hover:border-[var(--amber)] transition-all"
+                >
+                  <Download className="w-4 h-4 text-[var(--cyan)]" />
+                  Export .MD
+                </button>
+              </div>
+
+              {/* Virtualized Message List */}
+              <div className="bg-[var(--bg)] border border-[var(--border)] rounded-xl overflow-hidden h-[600px]">
+                <div className="p-4 border-b border-[var(--border)] bg-[var(--s1)] flex justify-between items-center">
+                  <div className="text-[9px] tracking-[2px] text-[var(--muted)] uppercase">
+                    Archive Feed ({filteredEntries.length} entries)
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="w-2 h-2 rounded-full bg-[var(--green)] animate-pulse"></div>
+                    <span className="text-[8px] text-[var(--muted)] uppercase tracking-widest">Live Feed</span>
+                  </div>
+                </div>
+                <FixedSizeList
+                  height={550}
+                  itemCount={filteredEntries.length}
+                  itemSize={140}
+                  width="100%"
+                  itemData={filteredEntries}
+                >
+                  {MessageRow}
+                </FixedSizeList>
+              </div>
+
+              {/* EXCLUSION */}
+              <div className="bg-[var(--s1)] border border-[var(--border)] rounded p-5 mb-4">
+                <div className="text-[9px] tracking-[3px] text-[var(--red)] uppercase mb-4 flex items-center gap-2">
+                  Exclude Keywords
+                  <div className="flex-1 h-px bg-[var(--border)]"></div>
+                </div>
+                <div className="flex gap-2 mb-2">
+                  <input 
+                    type="text" 
+                    value={exclInput} 
+                    onChange={e => setExclInput(e.target.value)}
+                    onKeyDown={e => { if (e.key === 'Enter') handleAddExcl(); }}
+                    placeholder="Word to block…" 
+                    className="flex-1 bg-[var(--bg)] border border-[var(--border)] text-[var(--text)] font-mono text-[11px] px-3.5 py-2 rounded-sm outline-none focus:border-[var(--red)] transition-colors"
+                  />
+                  <button onClick={handleAddExcl} className="bg-transparent text-[var(--red)] border border-[var(--red)] font-mono text-[9px] font-bold tracking-[2px] uppercase px-4 py-2 rounded-sm hover:bg-[var(--red)] hover:text-black transition-colors">
+                    + Add
+                  </button>
+                </div>
+                <div className="flex flex-wrap gap-1.5 mb-2">
+                  {excludedWords.map(w => (
+                    <div key={w} className="flex items-center gap-1.5 bg-[rgba(224,85,85,0.08)] border border-[rgba(224,85,85,0.2)] rounded-sm px-2.5 py-1 text-[9px] text-[var(--red)]">
+                      <span>{w}</span>
+                      <button onClick={() => setExcludedWords(prev => prev.filter(x => x !== w))} className="bg-transparent border-none text-[rgba(224,85,85,0.4)] cursor-pointer text-xs hover:text-[var(--red)] transition-colors">✕</button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* MANUAL CLEANUP */}
+              <div className="bg-[var(--s1)] border border-[var(--border)] rounded p-5 mb-4">
+                <div className="text-[9px] tracking-[3px] text-[var(--purple)] uppercase mb-4 flex items-center gap-2">
+                  Step 1: Manual Filtering & Cleanup
+                  <div className="flex-1 h-px bg-[var(--border)]"></div>
+                </div>
+                <div className="flex items-center gap-3 flex-wrap">
+                <label className="flex items-center gap-2 cursor-pointer select-none" onClick={() => setRemoveShort(!removeShort)}>
+                  <div className={`relative w-9 h-5 rounded-full transition-colors shrink-0 ${removeShort ? 'bg-[var(--amber)]' : 'bg-[var(--dim)]'}`}>
+                    <div className={`absolute top-[3px] w-3.5 h-3.5 rounded-full transition-all ${removeShort ? 'bg-white left-[19px]' : 'bg-[#666] left-[3px]'}`}></div>
+                  </div>
+                  <span className="text-[9px] text-[var(--muted)] tracking-[1px]">Remove entries shorter than</span>
+                </label>
+                <input 
+                  type="number" 
+                  value={minChars} 
+                  onChange={e => setMinChars(Number(e.target.value))} 
+                  min="10" max="2000"
+                  className="w-[70px] bg-[var(--bg)] border border-[var(--border)] text-[var(--text)] font-mono text-[11px] px-2.5 py-1.5 rounded-sm outline-none"
+                  onClick={e => e.stopPropagation()}
+                />
+                <span className="text-[9px] text-[var(--muted)] tracking-[1px]">chars</span>
+              </div>
+            </div>
+
+            <div className="flex gap-2 mb-4 items-center flex-wrap bg-[rgba(232,160,32,0.03)] p-4 border border-[rgba(232,160,32,0.1)] rounded">
+              <div className="w-full text-[9px] tracking-[2px] text-[var(--amber)] uppercase mb-2">Step 2: AI Deep Cleaning (Good Measure)</div>
+              <button onClick={() => runAIExtract()} disabled={isAiLoading} className="bg-[var(--amber)] text-black font-mono text-[9px] font-bold tracking-[2px] uppercase px-4 py-2 rounded hover:bg-[var(--amber-g)] disabled:opacity-50">
+                {isAiLoading ? 'Extracting...' : '🧠 Start AI Scan'}
+              </button>
+              <div className="flex items-center gap-2 ml-2">
+                <span className="text-[9px] text-[var(--muted)]">
+                  {filteredEntries.length} entries will be analyzed
+                </span>
+              </div>
+            <div className="ml-auto flex gap-2 items-center">
+                <span className="text-[8px] text-[var(--muted)] uppercase tracking-[1px] mr-2">Download Filtered Archive:</span>
+                <button onClick={() => downloadInstantText(false)} className="bg-transparent border border-[var(--border)] text-[var(--muted)] font-mono text-[9px] font-bold tracking-[2px] uppercase px-4 py-2 rounded hover:text-[var(--text)]">
+                  ⬇ .txt
+                </button>
+                <button onClick={() => downloadInstantText(true)} className="bg-transparent border border-[var(--border)] text-[var(--muted)] font-mono text-[9px] font-bold tracking-[2px] uppercase px-4 py-2 rounded hover:text-[var(--text)]">
+                  ⬇ .md
+                </button>
+              </div>
+            </div>
+
+            {aiBatches.length > 0 && (
+              <div className="bg-[var(--s1)] border border-[var(--border)] rounded p-4 mb-4">
+                <div className="flex items-center justify-between mb-3">
+                  <div className="text-[9px] tracking-[2px] text-[var(--muted)] uppercase flex items-center gap-2">
+                    <span className="w-1 h-1 rounded-full bg-[var(--cyan)]"></span>
+                    Extraction Progress
+                  </div>
+                  {aiBatches.some(b => b.status === 'error') && !isAiLoading && (
+                    <button 
+                      onClick={() => runAIExtract(aiBatches.filter(b => b.status === 'error'))}
+                      className="text-[9px] text-[var(--red)] border border-[var(--red)] px-2 py-1 rounded hover:bg-[var(--red)] hover:text-black transition-colors uppercase font-bold tracking-[1px]"
+                    >
+                      Retry Failed Chunks
+                    </button>
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {aiBatches.map(b => (
+                    <div 
+                      key={b.id} 
+                      title={b.status === 'error' ? `Error: ${b.error}` : `Chunk ${b.id + 1}: ${b.status}`}
+                      className={`w-3 h-3 rounded-sm transition-colors ${
+                        b.status === 'success' ? 'bg-[var(--green)]' :
+                        b.status === 'error' ? 'bg-[var(--red)] animate-pulse' :
+                        b.status === 'processing' ? 'bg-[var(--amber)] animate-pulse' :
+                        'bg-[var(--dim)]'
+                      }`}
+                    ></div>
+                  ))}
+                </div>
+                {isAiLoading && <div className="text-[var(--cyan)] text-[10px] mt-3 animate-pulse">{aiProgress}</div>}
+              </div>
+            )}
+
+              {(aiRejectedStories.length > 0 || isAiLoading) && (
+                <div className="mb-8">
+                  <div className="flex items-center gap-3 my-6 text-[9px] tracking-[4px] text-[var(--red)] uppercase">
+                    <div className="flex-1 h-px bg-gradient-to-r from-transparent to-[var(--border)]"></div>
+                    🚫 AI Rejected (Removed from Scan)
+                    <div className="flex-1 h-px bg-gradient-to-r from-[var(--border)] to-transparent"></div>
+                  </div>
+                  
+                  <div className="bg-[var(--s1)] border border-[var(--border)] rounded p-6 mb-6 relative overflow-hidden">
+                    {isAiLoading && (
+                      <div className="absolute top-0 left-0 h-1 bg-[var(--amber)] transition-all duration-300" style={{ width: `${(aiProcessedSoFar / aiTotalProcessed) * 100}%` }}></div>
+                    )}
+                    <div className="flex justify-between items-center mb-6">
+                      <div className="text-[9px] tracking-[3px] text-[var(--amber)] uppercase">Live AI Processing Funnel</div>
+                      <div className="text-[8px] text-[var(--muted)] uppercase tracking-[1px]">Check "2. AI Stories" for results</div>
+                    </div>
+                    
+                    <div className="flex items-center justify-between text-center divide-x divide-[var(--border)]">
+                      <div className="flex-1 px-4">
+                        <div className="text-[10px] text-[var(--muted)] uppercase tracking-[1px] mb-1">Started With</div>
+                        <div className="font-serif text-4xl text-[var(--text)]">{aiTotalProcessed || filteredEntries.length}</div>
+                        <div className="text-[9px] text-[var(--muted)] mt-1">valid entries</div>
+                      </div>
+                      <div className="flex-1 px-4">
+                        <div className="text-[10px] text-[var(--muted)] uppercase tracking-[1px] mb-1">Remaining</div>
+                        <div className="font-serif text-4xl text-[var(--cyan)]">{aiTotalProcessed > 0 ? aiTotalProcessed - aiProcessedSoFar : 0}</div>
+                        <div className="text-[9px] text-[var(--muted)] mt-1">in queue</div>
+                      </div>
+                      <div className="flex-1 px-4">
+                        <div className="text-[10px] text-[var(--muted)] uppercase tracking-[1px] mb-1">AI Removed</div>
+                        <div className="font-serif text-4xl text-[var(--red)]">{aiRejectedStories.length}</div>
+                        <div className="text-[9px] text-[var(--muted)] mt-1">low signal</div>
+                      </div>
+                      <div className="flex-1 px-4">
+                        <div className="text-[10px] text-[var(--muted)] uppercase tracking-[1px] mb-1">AI Kept</div>
+                        <div className="font-serif text-4xl text-[var(--amber)]">{aiStories.length}</div>
+                        <div className="text-[9px] text-[var(--muted)] mt-1">high quality</div>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="max-h-[60vh] overflow-y-auto pr-2">
+                    {aiRejectedStories.map((e, i) => {
+                      const r = e.aiReason || 'Other';
+                      return (
+                        <div key={i} className="bg-[var(--s1)] border border-[var(--border)] rounded p-4 mb-3 border-l-4 border-l-[var(--red)] opacity-60 hover:opacity-100 transition-opacity">
+                          <div className="flex justify-between items-start mb-2">
+                            <span className="px-2 py-0.5 border border-[var(--red)] text-[var(--red)] text-[8px] tracking-[1px] uppercase rounded font-bold">{r}</span>
+                            <button 
+                              onClick={() => {
+                                setAiStories(prev => [...prev, { text: e.text, one_line: e.text.slice(0, 50) + '...', theme: 'Restored', emotion: 'Unknown', timeframe: 'Unknown', importance: 5 }]);
+                                setAiRejectedStories(prev => prev.filter((_, idx) => idx !== i));
+                              }}
+                              className="px-2 py-0.5 bg-[var(--green)] text-black rounded text-[7px] font-bold uppercase"
+                            >
+                              Restore
+                            </button>
+                          </div>
+                          <div className="text-[10px] leading-relaxed text-[var(--muted)] line-through decoration-[rgba(224,85,85,0.1)]">{e.text}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {activeTab === 'removed' && (
+        <div className="space-y-6">
+          <div className="text-center mb-6">
+            <div className="font-serif italic text-2xl text-[var(--amber)] mb-2">Archive Exclusions</div>
+            <p className="text-[11px] text-[var(--muted)] leading-loose max-w-lg mx-auto">
+              Review everything that was removed by manual filters or rejected by the AI during the deep scan.
+            </p>
+          </div>
+
+          {/* KEYWORD DELETED BOX */}
+          {filteredData.removed.filter(e => e.removalReason === 'Keyword').length > 0 && (
+            <div className="bg-[var(--s1)] border border-[var(--border)] rounded overflow-hidden mb-8">
+              <div className="p-3 border-b border-[var(--border)] flex justify-between items-center bg-[rgba(232,160,32,0.05)]">
+                <div className="flex items-center gap-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-[var(--amber)]"></span>
+                  <span className="text-[9px] tracking-[3px] text-[var(--amber)] uppercase font-bold">Keyword Deleted Messages</span>
+                </div>
+                <div className="flex items-center gap-4">
+                  {selectedKeyword && (
+                    <button 
+                      onClick={() => setSelectedKeyword(null)}
+                      className="text-[8px] text-[var(--amber)] border border-[var(--amber)] px-2 py-0.5 rounded hover:bg-[var(--amber)] hover:text-black transition-all uppercase font-bold"
+                    >
+                      Clear Filter: {selectedKeyword}
+                    </button>
+                  )}
+                  <span className="text-[8px] text-[var(--amber)] opacity-60 uppercase tracking-[1px]">
+                    {filteredData.removed.filter(e => e.removalReason === 'Keyword').length} total keyword removals
+                  </span>
+                </div>
+              </div>
+              
+              {/* Keyword Filter Bar */}
+              <div className="p-4 bg-[var(--bg)] border-b border-[var(--border)] flex flex-wrap gap-2">
+                <div className="text-[8px] text-[var(--muted)] uppercase tracking-[2px] w-full mb-1 font-bold">Filter by Keyword:</div>
+                {activeKeywords.map(([k, count]) => (
+                  <button
+                    key={k}
+                    onClick={() => setSelectedKeyword(selectedKeyword === k ? null : k)}
+                    className={`px-3 py-1.5 rounded text-[9px] font-bold uppercase tracking-[1px] transition-all border ${
+                      selectedKeyword === k 
+                        ? 'bg-[var(--amber)] text-black border-[var(--amber)] shadow-lg shadow-[var(--amber-dim)]' 
+                        : 'bg-[var(--s1)] text-[var(--muted)] border-[var(--border)] hover:border-[var(--amber)] hover:text-[var(--amber)]'
+                    }`}
+                  >
+                    {k} <span className="opacity-50 ml-1">({count})</span>
+                  </button>
+                ))}
+              </div>
+
+              <div className="max-h-[400px] overflow-y-auto custom-scrollbar">
+                {removedEntries.filter(e => e.removalReason === 'Keyword').length === 0 ? (
+                  <div className="p-12 text-center text-[var(--muted)] text-[10px] tracking-[1px] italic">
+                    No messages match the selected keyword filter.
+                  </div>
+                ) : (
+                  removedEntries.filter(e => e.removalReason === 'Keyword').map((e, i) => (
+                    <div key={i} className="p-5 border-b border-[var(--border)] last:border-b-0 hover:bg-[rgba(232,160,32,0.02)] relative group">
+                      <div className="flex items-center gap-2 text-[9px] tracking-[1px] text-[var(--muted)] mb-3">
+                        <span className="px-2 py-0.5 bg-[rgba(232,160,32,0.1)] text-[var(--amber)] text-[8px] tracking-[1px] uppercase rounded font-bold flex items-center gap-1">
+                          <span>🚫</span>
+                          <span className="flex gap-1">
+                            Keyword: {e.matchedKeywords?.map((k, kidx) => (
+                              <button 
+                                key={kidx} 
+                                onClick={(ev) => { ev.stopPropagation(); setSelectedKeyword(k); }}
+                                className="hover:underline cursor-pointer"
+                              >
+                                {k}{kidx < (e.matchedKeywords?.length || 0) - 1 ? ',' : ''}
+                              </button>
+                            ))}
+                          </span>
+                        </span>
+                        <div className="ml-auto opacity-0 group-hover:opacity-100 transition-opacity">
+                          <span className="text-[8px] text-[var(--muted)] uppercase tracking-tighter">{e.source}</span>
+                        </div>
+                      </div>
+                      <div className="text-xs leading-loose text-[var(--muted)] whitespace-pre-wrap italic opacity-80">
+                        {highlightKeywords(e.text, e.matchedKeywords || [])}
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* AI REJECTED BOX */}
+          {aiRejectedStories.length > 0 && (
+            <div className="bg-[var(--s1)] border border-[var(--border)] rounded overflow-hidden">
+              <div className="p-3 border-b border-[var(--border)] flex justify-between items-center bg-[rgba(224,85,85,0.03)]">
+                <div className="flex items-center gap-2">
+                  <span className="w-1.5 h-1.5 rounded-full bg-[var(--amber)]"></span>
+                  <span className="text-[9px] tracking-[3px] text-[var(--amber)] uppercase font-bold">AI Rejected (Low Signal)</span>
+                </div>
+                <span className="text-[8px] text-[var(--red)] opacity-60 uppercase tracking-[1px]">{aiRejectedStories.length} entries</span>
+              </div>
+              <div className="max-h-[400px] overflow-y-auto custom-scrollbar">
+                {aiRejectedStories.map((e, i) => {
+                  const r = e.aiReason || 'Other';
+                  const icons: Record<string, string> = {
+                    'Technical': '🛠️',
+                    'AI-Talk': '🤖',
+                    'Trivial': '🤏',
+                    'Greeting': '👋',
+                    'Instruction': '📝',
+                    'Bot-Freeze': '❄️',
+                    'Other': '❓'
+                  };
+                  const icon = icons[r] || '❓';
+
+                  return (
+                    <div key={i} className="p-4 border-b border-[var(--border)] last:border-b-0 opacity-40 hover:opacity-100 transition-opacity group">
+                      <div className="flex items-center gap-2 text-[8px] mb-2 text-[var(--muted)]">
+                        <span className="px-1.5 py-0.5 border border-[var(--red)] text-[var(--red)] rounded uppercase font-bold flex items-center gap-1">
+                          <span>{icon}</span>
+                          <span>{r}</span>
+                        </span>
+                        <span>{e.charCount} chars</span>
+                        <button 
+                          onClick={() => {
+                            console.log("Button Click: Restore Rejected Story");
+                            setAiStories(prev => [...prev, { text: e.text, one_line: e.text.slice(0, 50) + '...', theme: 'Restored', emotion: 'Unknown', timeframe: 'Unknown', importance: 5 }]);
+                            setAiRejectedStories(prev => prev.filter((_, idx) => idx !== i));
+                          }}
+                          className="ml-2 px-2 py-0.5 bg-[var(--green)] text-black rounded text-[7px] font-bold uppercase opacity-60 hover:opacity-100 transition-opacity cursor-pointer"
+                        >
+                          Restore
+                        </button>
+                        <div className="ml-auto flex items-center gap-2">
+                          <span className="text-[var(--muted)]">AI Score:</span>
+                          <span className="text-[var(--red)]">{e.score}</span>
+                        </div>
+                      </div>
+                      <div className="text-[10px] leading-relaxed text-[var(--muted)] line-through decoration-[rgba(224,85,85,0.1)]">{e.text.slice(0, 300)}{e.text.length > 300 ? '...' : ''}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* REMOVED MESSAGES */}
+          <div className="bg-[var(--s1)] border border-[var(--border)] rounded overflow-hidden">
+            <div className="p-3 border-b border-[var(--border)] flex justify-between items-center bg-[rgba(224,85,85,0.03)]">
+              <div className="flex items-center gap-2">
+                <span className="w-1.5 h-1.5 rounded-full bg-[var(--red)]"></span>
+                <span className="text-[9px] tracking-[3px] text-[var(--red)] uppercase font-bold">Manually Filtered Messages</span>
+              </div>
+              <span className="text-[9px] tracking-[2px] text-[var(--muted)] uppercase">{removedEntries.length} entries filtered out</span>
+            </div>
+            <div className="max-h-[500px] overflow-y-auto custom-scrollbar">
+              {removedEntries.length === 0 ? (
+                <div className="p-12 text-center text-[var(--muted)] text-[10px] tracking-[1px] italic">
+                  No messages have been removed by current filters.
+                </div>
+              ) : (
+                <>
+                  {removedEntries.slice(0, 100).map((e, i) => {
+                    let reason = 'Filter';
+                    let icon = '⚙️';
+                    if (e.isHidden) { reason = 'Manual'; icon = '👁️‍🗨️'; }
+                    else if (e.isAssistant) { reason = 'AI-Reply'; icon = '🤖'; }
+                    else if (removeShort && e.charCount < minChars) { reason = 'Short'; icon = '📏'; }
+                    else if (e.score < minScore) { reason = 'Low-Score'; icon = '📉'; }
+                    else { reason = 'Keyword'; icon = '🚫'; }
+
+                    return (
+                      <div key={i} className="p-5 border-b border-[var(--border)] hover:bg-[rgba(224,85,85,0.02)] relative group">
+                        <div className="flex items-center gap-2 text-[9px] tracking-[1px] text-[var(--muted)] mb-3">
+                          <span className="px-2 py-0.5 bg-[rgba(224,85,85,0.1)] text-[var(--red)] text-[8px] tracking-[1px] uppercase rounded font-bold flex items-center gap-1">
+                            <span>{icon}</span>
+                            <span>{reason}</span>
+                          </span>
+                          {e.removalReason === 'Keyword' && e.matchedKeywords && (
+                            <span className="text-[var(--amber)] opacity-80 font-bold flex gap-1">
+                              [
+                              {e.matchedKeywords.map((k, kidx) => (
+                                <button 
+                                  key={kidx} 
+                                  onClick={(ev) => { ev.stopPropagation(); setSelectedKeyword(k); }}
+                                  className="hover:underline cursor-pointer"
+                                >
+                                  {k}{kidx < (e.matchedKeywords?.length || 0) - 1 ? ',' : ''}
+                                </button>
+                              ))}
+                              ]
+                            </span>
+                          )}
+                          {e.score < minScore && <span className="text-[var(--red)] opacity-60">Score {e.score}</span>}
+                          {removeShort && e.charCount < minChars && <span className="text-[var(--red)] opacity-60">{e.charCount}c</span>}
+                          <div className="ml-auto opacity-0 group-hover:opacity-100 transition-opacity">
+                            <span className="text-[8px] text-[var(--muted)] uppercase tracking-tighter">{e.source}</span>
+                          </div>
+                        </div>
+                        <div className="text-xs leading-loose text-[var(--muted)] whitespace-pre-wrap italic line-through decoration-[rgba(224,85,85,0.2)] opacity-50">{e.text}</div>
+                      </div>
+                    );
+                  })}
+                  {removedEntries.length > 100 && (
+                    <div className="p-4 text-center text-[var(--muted)] text-[9px] tracking-[1px] uppercase border-t border-[var(--border)] bg-[var(--bg)]">
+                      + {removedEntries.length - 100} more removed entries hidden
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeTab === 'analysis' && (
+        <div className="space-y-6 animate-in slide-in-from-bottom-4 duration-500">
+          <div className="text-center mb-8">
+            <div className="font-serif italic text-3xl text-[var(--amber)] mb-2">AI Curated Stories</div>
+            <p className="text-[11px] text-[var(--muted)] leading-loose max-w-lg mx-auto uppercase tracking-[2px]">
+              High-signal life memories extracted via deep scan
+            </p>
+          </div>
+
+          {aiStories.length === 0 && !isAiLoading && (
+            <div className="bg-[var(--s1)] border border-[var(--border)] rounded-2xl p-16 text-center">
+              <Sparkles className="w-12 h-12 text-[var(--dim)] mx-auto mb-4" />
+              <p className="text-[var(--muted)] text-xs uppercase tracking-[2px]">No stories extracted yet. Run the AI Scan in the first tab.</p>
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 gap-6">
+            {aiStories.map((s, i) => (
+              <motion.div 
+                key={i}
+                initial={{ opacity: 0, x: -20 }}
+                animate={{ opacity: 1, x: 0 }}
+                transition={{ delay: i * 0.05 }}
+                className="bg-[var(--s1)] border border-[var(--border)] rounded-2xl overflow-hidden shadow-xl hover:border-[var(--amber)] transition-all group"
+              >
+                <div className="p-6">
+                  <div className="flex justify-between items-start mb-4">
+                    <div className="space-y-1">
+                      <div className="text-[10px] tracking-[3px] text-[var(--amber)] uppercase font-bold">{s.theme}</div>
+                      <h3 className="font-serif text-xl text-[var(--text)] italic leading-tight">{s.one_line}</h3>
+                    </div>
+                    <div className="bg-[var(--bg)] border border-[var(--border)] rounded-full px-3 py-1 text-[10px] font-mono text-[var(--cyan)]">
+                      {s.importance}/10
+                    </div>
+                  </div>
+                  <div className="text-sm leading-relaxed text-[var(--muted)] italic border-l-2 border-[var(--dim)] pl-4 mb-4">
+                    "{s.text}"
+                  </div>
+                  <div className="flex items-center gap-4 text-[9px] text-[var(--muted)] uppercase tracking-widest">
+                    <span className="flex items-center gap-1"><Sparkles className="w-3 h-3" /> {s.emotion}</span>
+                    <span className="flex items-center gap-1"><Clock className="w-3 h-3" /> {s.timeframe}</span>
+                  </div>
+                </div>
+              </motion.div>
+            ))}
+          </div>
+
+          {aiStories.length > 0 && (
+            <div className="flex justify-center pt-8">
+              <button 
+                onClick={() => downloadAIText(true)}
+                className="bg-[var(--amber)] text-black font-mono text-[10px] font-bold tracking-[3px] uppercase px-8 py-4 rounded-full hover:bg-[var(--amber-g)] shadow-lg shadow-[var(--amber-dim)] transition-all"
+              >
+                Export AI Archive (.MD)
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {activeTab === 'compare' && (
+        <div className="space-y-6 animate-in fade-in duration-500">
+          <div className="text-center mb-8">
+            <div className="font-serif italic text-3xl text-[var(--amber)] mb-2">Archive Comparison</div>
+            <p className="text-[11px] text-[var(--muted)] leading-loose max-w-lg mx-auto uppercase tracking-[2px]">
+              Upload a new file to check for missing life information against your current archive.
+            </p>
+          </div>
+
+          <div className="bg-[var(--s1)] border border-[var(--border)] rounded-xl p-8 text-center">
+            <input 
+              type="file" 
+              id="compare-upload" 
+              className="hidden" 
+              onChange={e => e.target.files && handleComparisonFiles(e.target.files)} 
+            />
+            <label 
+              htmlFor="compare-upload"
+              className="inline-flex flex-col items-center justify-center cursor-pointer group"
+            >
+              <div className="w-16 h-16 rounded-full bg-[var(--bg)] border border-[var(--border)] flex items-center justify-center mb-4 group-hover:border-[var(--amber)] transition-all">
+                <GitCompare className="w-8 h-8 text-[var(--muted)] group-hover:text-[var(--amber)]" />
+              </div>
+              <div className="text-sm text-[var(--text)] font-serif italic mb-1">Select file to compare</div>
+              <div className="text-[10px] text-[var(--muted)] uppercase tracking-[1px]">.json or .txt</div>
+            </label>
+
+            {/* Comparison History */}
+            {fileHistory.filter(h => h.type === 'compare').length > 0 && (
+              <div className="mt-8 pt-8 border-t border-[var(--border)] text-left">
+                <div className="flex items-center justify-between mb-4">
+                  <div className="text-[9px] tracking-[3px] text-[var(--muted)] uppercase font-bold flex items-center gap-2">
+                    <History className="w-3 h-3 text-[var(--cyan)]" /> Recent Comparison Files
+                  </div>
+                  <div className="flex gap-2">
+                    <button 
+                      onClick={clearAllHistory}
+                      className="text-[8px] tracking-[2px] text-[var(--red)] border border-[var(--red)] px-2 py-1 rounded hover:bg-[var(--red)] hover:text-black transition-all uppercase font-bold"
+                    >
+                      Clear All History
+                    </button>
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {fileHistory.filter(h => h.type === 'compare').map((h: any) => (
+                    <div key={h.key} className="flex items-center gap-3 p-3 bg-[var(--bg)] border border-[var(--border)] rounded-lg hover:border-[var(--cyan)] transition-all group">
+                      <FileText className="w-4 h-4 text-[var(--muted)] shrink-0" />
+                      <div className="flex-1 min-w-0 cursor-pointer" onClick={() => loadFromHistory(h.key)}>
+                        <div className="flex items-center gap-2">
+                          <div className="text-[10px] text-[var(--text)] truncate font-bold">{h.name}</div>
+                        </div>
+                        <div className="text-[8px] text-[var(--muted)] uppercase tracking-tighter">
+                          {new Date(h.timestamp).toLocaleDateString()} · {(h.size / 1024).toFixed(1)} KB
+                        </div>
+                      </div>
+                      <button 
+                        onClick={(e) => { e.stopPropagation(); deleteFromHistory(h.key); }}
+                        className="p-1 hover:bg-[var(--dim)] rounded text-[var(--muted)] hover:text-[var(--red)] transition-colors opacity-0 group-hover:opacity-100"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {comparisonEntries.length > 0 && (
+              <div className="mt-8 pt-8 border-t border-[var(--border)]">
+                <div className="flex items-center justify-center gap-4 mb-6">
+                  <div className="text-left">
+                    <div className="text-[8px] text-[var(--muted)] uppercase tracking-[1px]">New Data</div>
+                    <div className="text-xl font-serif text-[var(--amber)]">{comparisonEntries.length} entries</div>
+                  </div>
+                  <div className="w-px h-8 bg-[var(--border)]"></div>
+                  <div className="text-left">
+                    <div className="text-[8px] text-[var(--muted)] uppercase tracking-[1px]">Source Archive</div>
+                    <div className="text-xl font-serif text-[var(--cyan)]">{filteredEntries.length} entries</div>
+                  </div>
+                </div>
+
+                <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
+                  <button 
+                    onClick={() => runComparison(false)}
+                    disabled={isComparing}
+                    className="w-full sm:w-auto bg-[var(--amber)] text-black font-mono text-[10px] font-bold tracking-[2px] uppercase px-8 py-3 rounded-full hover:bg-[var(--amber-g)] disabled:opacity-50 transition-all shadow-lg shadow-[var(--amber-dim)]"
+                  >
+                    {isComparing && !comparisonResults ? 'Comparing Archives...' : '🔍 Run Gap Analysis'}
+                  </button>
+
+                  {comparisonResults && (
+                    <button 
+                      onClick={() => runComparison(true)}
+                      disabled={isComparing}
+                      className="w-full sm:w-auto bg-transparent border border-[var(--amber)] text-[var(--amber)] font-mono text-[10px] font-bold tracking-[2px] uppercase px-8 py-3 rounded-full hover:bg-[var(--amber-dim)] disabled:opacity-50 transition-all"
+                    >
+                      {isComparing ? 'Deep Scanning...' : '🔬 Rescan for More Nuances'}
+                    </button>
+                  )}
+                </div>
+
+                {comparisonThoughts.length > 0 && (
+                  <div className="mt-8 bg-[var(--s1)] border border-[var(--border)] rounded-xl p-6 text-left">
+                    <h4 className="text-[10px] tracking-[3px] text-[var(--cyan)] uppercase font-bold mb-4 flex items-center gap-2">
+                      <Brain className="w-3 h-3" /> AI Thought Process & Reasoning
+                    </h4>
+                    <div className="space-y-4 max-h-[300px] overflow-y-auto custom-scrollbar pr-2">
+                      {comparisonThoughts.map((thought, idx) => (
+                        <div key={idx} className="text-[11px] leading-relaxed text-[var(--muted)] italic border-l border-[var(--dim)] pl-4">
+                          {thought}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {comparisonBatches.length > 0 && (
+                  <div className="mt-6 bg-[var(--bg)] border border-[var(--border)] rounded-xl p-4">
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="text-[9px] tracking-[2px] text-[var(--muted)] uppercase flex items-center gap-2">
+                        <span className="w-1 h-1 rounded-full bg-[var(--cyan)]"></span>
+                        Comparison Progress (Scanning Archive Chunks)
+                      </div>
+                      {isComparing && comparisonThoughts.length > 0 && (
+                        <div className="text-[9px] text-[var(--cyan)] italic animate-pulse">
+                          Live Reasoning: {comparisonThoughts[comparisonThoughts.length - 1].substring(0, 60)}...
+                        </div>
+                      )}
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                      {comparisonBatches.map(b => (
+                        <div 
+                          key={b.id} 
+                          className={`w-3 h-3 rounded-sm transition-colors ${
+                            b.status === 'success' ? 'bg-[var(--green)]' :
+                            b.status === 'error' ? 'bg-[var(--red)] animate-pulse' :
+                            b.status === 'processing' ? 'bg-[var(--amber)] animate-pulse' :
+                            'bg-[var(--dim)]'
+                          }`}
+                        ></div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {comparisonResults && (
+            <div className="space-y-6">
+              <div className="flex justify-end gap-2">
+                <button 
+                  onClick={() => downloadComparisonReport(false)}
+                  className="bg-transparent border border-[var(--border)] text-[var(--muted)] font-mono text-[9px] font-bold tracking-[2px] uppercase px-4 py-2 rounded hover:text-[var(--text)]"
+                >
+                  ⬇ .txt
+                </button>
+                <button 
+                  onClick={() => downloadComparisonReport(true)}
+                  className="bg-transparent border border-[var(--border)] text-[var(--muted)] font-mono text-[9px] font-bold tracking-[2px] uppercase px-4 py-2 rounded hover:text-[var(--text)]"
+                >
+                  ⬇ .md
+                </button>
+              </div>
+
+              <motion.div 
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="bg-[var(--s1)] border border-[var(--border)] rounded-xl p-8 relative overflow-hidden shadow-2xl"
+              >
+                <div className="absolute top-0 left-0 w-1.5 h-full bg-[var(--cyan)]"></div>
+                <h3 className="text-[11px] tracking-[4px] text-[var(--cyan)] uppercase font-bold mb-8 flex items-center gap-3">
+                  <Sparkles className="w-4 h-4" /> Comprehensive Gap Analysis Report
+                </h3>
+                <div className="text-lg sm:text-xl leading-relaxed text-[var(--text)] whitespace-pre-wrap font-serif italic prose prose-invert max-w-none bg-[rgba(44,200,168,0.02)] p-8 rounded-lg border border-[rgba(44,200,168,0.1)]">
+                  {comparisonResults}
+                </div>
+              </motion.div>
+            </div>
+          )}
+
+          {comparisonFindings.length > 0 && (
+            <div className="space-y-8">
+              {/* AI ANALYSIS & EXPLANATIONS */}
+              <div className="space-y-4">
+                <div className="flex justify-between items-end">
+                  <div className="text-[9px] tracking-[3px] text-[var(--amber)] uppercase flex items-center gap-2 flex-1">
+                    AI Insight: Why these stories are missing
+                    <div className="flex-1 h-px bg-[var(--border)]"></div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div className="bg-[var(--s1)] border border-[var(--border)] rounded-xl p-4 flex flex-col justify-center">
+                    <div className="text-[8px] tracking-[2px] text-[var(--muted)] uppercase mb-1">Total Gaps Found</div>
+                    <div className="font-serif text-2xl text-[var(--amber)]">{comparisonFindings.length}</div>
+                  </div>
+                  <div className="bg-[var(--s1)] border border-[var(--border)] rounded-xl p-4 flex flex-col justify-center">
+                    <div className="text-[8px] tracking-[2px] text-[var(--muted)] uppercase mb-1">Archive Coverage</div>
+                    <div className="font-serif text-2xl text-[var(--cyan)]">
+                      {filteredEntries.length > 0 ? Math.round(((filteredEntries.length - comparisonFindings.length) / filteredEntries.length) * 100) : 0}%
+                    </div>
+                  </div>
+                  <div className="bg-[var(--s1)] border border-[var(--border)] rounded-xl p-4 flex flex-col justify-center">
+                    <div className="text-[8px] tracking-[2px] text-[var(--muted)] uppercase mb-1">Deep Scan Status</div>
+                    <div className="text-[10px] text-[var(--text)] font-mono uppercase tracking-[1px]">
+                      {isComparing ? 'Scanning...' : 'Idle'}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-[var(--s1)] border border-[var(--border)] rounded-xl overflow-hidden">
+                  <div className="max-h-[600px] overflow-y-auto p-6 space-y-12 custom-scrollbar bg-[var(--bg)]">
+                    {comparisonFindings.map((f, idx) => (
+                      <motion.div 
+                        key={idx}
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        className="relative group"
+                      >
+                        {/* Minimalist Header */}
+                        <div className="flex items-center gap-4 mb-10">
+                          <div className="text-[10px] font-bold text-[var(--amber)] tracking-[3px] uppercase">
+                            Gap {idx + 1}
+                          </div>
+                          <div className="h-px flex-1 bg-[var(--border)] opacity-30"></div>
+                        </div>
+
+                        {/* Editorial Style Explanation */}
+                        <div className="max-w-4xl mx-auto space-y-10">
+                          <div className="space-y-6">
+                            <h3 className="text-2xl sm:text-3xl font-serif text-[var(--text)] leading-tight italic">
+                              {f.reason}
+                            </h3>
+                            <div className="text-sm sm:text-base text-[var(--muted)] leading-relaxed font-sans max-w-3xl border-l border-[var(--border)] pl-6">
+                              <span className="text-[10px] text-[var(--amber)] uppercase tracking-[2px] block mb-2 font-bold opacity-70">Contextual Importance</span>
+                              {f.importanceReason}
+                            </div>
+                          </div>
+
+                          {/* Side-by-Side Quotes (Minimalist) */}
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-16 pt-10 border-t border-[var(--border)]">
+                            {/* Source Quote */}
+                            <div className="space-y-6">
+                              <div className="text-[9px] tracking-[3px] text-[var(--muted)] uppercase font-bold opacity-50">
+                                Source Archive (Full Message)
+                              </div>
+                              <div className="text-base sm:text-lg leading-relaxed text-[var(--text)] font-serif italic">
+                                "{renderHighlightedText(f.entry.text, f.sourceHighlight, 'bg-[var(--amber)]')}"
+                              </div>
+                            </div>
+
+                            {/* New File Quote */}
+                            <div className="space-y-6">
+                              <div className="text-[9px] tracking-[3px] text-[var(--muted)] uppercase font-bold opacity-50">
+                                Related Context in New File
+                              </div>
+                              {f.newFileFullMessage ? (
+                                <>
+                                  <div className="text-base sm:text-lg leading-relaxed text-[var(--text)] font-serif italic">
+                                    "{renderHighlightedText(f.newFileFullMessage, f.newFileQuote, 'bg-[var(--cyan)]')}"
+                                  </div>
+                                  <div className="text-xs text-[var(--muted)] leading-relaxed bg-[var(--s1)] p-4 rounded-lg border border-[var(--border)]">
+                                    <span className="text-[9px] text-[var(--cyan)] uppercase tracking-[2px] block mb-2 font-bold">Nuance Connection</span>
+                                    {f.connectionReason}
+                                  </div>
+                                </>
+                              ) : (
+                                <div className="h-full flex items-center justify-center py-10 border border-dashed border-[var(--border)] rounded-xl opacity-50">
+                                  <div className="text-[10px] text-[var(--muted)] uppercase tracking-[3px] italic">Entirely Absent</div>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Separator for next item */}
+                        {idx < comparisonFindings.length - 1 && (
+                          <div className="mt-16 flex justify-center">
+                            <div className="w-1 h-1 rounded-full bg-[var(--border)] mx-1"></div>
+                            <div className="w-1 h-1 rounded-full bg-[var(--border)] mx-1"></div>
+                            <div className="w-1 h-1 rounded-full bg-[var(--border)] mx-1"></div>
+                          </div>
+                        )}
+                      </motion.div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      {activeTab === 'chat' && (
+        <div>
+          <div className="bg-[var(--s1)] border border-[var(--border)] rounded p-5 mb-4">
+            <div className="text-[9px] tracking-[3px] text-[var(--muted)] uppercase mb-4 flex items-center gap-2">
+              Archive Intelligence
+              <div className="flex-1 h-px bg-[var(--border)]"></div>
+            </div>
+            <div className="text-[9px] text-[var(--cyan)] tracking-[1px] mb-3">Using top stories as context.</div>
+            <div className="flex flex-wrap gap-1.5">
+              {['Recurring themes', 'Key people', 'Fears & struggles', 'Defining moments'].map(p => (
+                <button key={p} onClick={() => setChatInput(p)} className="px-3 py-1.5 bg-[var(--bg)] border border-[var(--border)] rounded text-[9px] text-[var(--muted)] tracking-[1px] hover:border-[var(--cyan)] hover:text-[var(--cyan)] transition-colors cursor-pointer">
+                  {p}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="bg-[var(--s1)] border border-[var(--border)] rounded overflow-hidden">
+            <div className="min-h-[300px] max-h-[500px] overflow-y-auto p-5 flex flex-col gap-4">
+              {chatHistory.length === 0 && (
+                <div className="text-center text-[var(--muted)] text-[11px] leading-loose p-8">
+                  <strong className="text-[var(--text)] block mb-1">Archive Chat</strong>
+                  Ask anything about your life stories.
+                </div>
+              )}
+              {chatHistory.map((msg, i) => (
+                <div key={i} className={`flex gap-3 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
+                  <div className={`w-7 h-7 rounded flex items-center justify-center text-[10px] shrink-0 font-serif ${msg.role === 'user' ? 'bg-[var(--amber-dim)] text-[var(--amber)] border border-[rgba(232,160,32,0.2)]' : 'bg-[rgba(44,200,168,0.1)] text-[var(--cyan)] border border-[rgba(44,200,168,0.2)]'}`}>
+                    {msg.role === 'user' ? 'You' : 'AI'}
+                  </div>
+                  <div className={`max-w-[75%] p-3 rounded text-xs leading-loose text-[var(--text)] ${msg.role === 'user' ? 'bg-[var(--amber-dim)] border border-[rgba(232,160,32,0.15)]' : 'bg-[var(--s2)] border border-[var(--border)]'}`}>
+                    {msg.content}
+                  </div>
+                </div>
+              ))}
+              {isChatLoading && (
+                <div className="flex gap-3">
+                  <div className="w-7 h-7 rounded flex items-center justify-center text-[10px] shrink-0 font-serif bg-[rgba(44,200,168,0.1)] text-[var(--cyan)] border border-[rgba(44,200,168,0.2)]">AI</div>
+                  <div className="max-w-[75%] p-3 rounded text-xs leading-loose text-[var(--text)] bg-[var(--s2)] border border-[var(--border)]">Thinking...</div>
+                </div>
+              )}
+            </div>
+            <div className="flex border-t border-[var(--border)]">
+              <textarea
+                value={chatInput}
+                onChange={e => setChatInput(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); } }}
+                placeholder="Ask something about your life stories…"
+                className="flex-1 bg-transparent border-none text-[var(--text)] font-mono text-xs p-3.5 outline-none resize-none h-12 placeholder:text-[var(--muted)]"
+              />
+              <button
+                onClick={sendChat}
+                disabled={isChatLoading || !chatInput.trim()}
+                className="px-5 bg-transparent border-none border-l border-[var(--border)] text-[var(--amber)] cursor-pointer text-sm transition-colors hover:bg-[var(--amber-dim)] disabled:text-[var(--muted)] disabled:cursor-not-allowed"
+              >
+                ➤
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {notification && (
+        <div className={`fixed bottom-8 right-8 z-[200] px-6 py-4 rounded-lg shadow-2xl border animate-in slide-in-from-right-8 duration-300 flex items-center gap-3 ${
+          notification.type === 'error' ? 'bg-[#2a1a1a] border-[var(--red)] text-[var(--red)]' : 
+          notification.type === 'success' ? 'bg-[#1a2a1a] border-[var(--green)] text-[var(--green)]' : 
+          'bg-[var(--s1)] border-[var(--cyan)] text-[var(--cyan)]'
+        }`}>
+          <span className="text-lg">
+            {notification.type === 'error' ? '❌' : notification.type === 'success' ? '✅' : 'ℹ️'}
+          </span>
+          <div className="font-mono text-xs tracking-[1px]">{notification.msg}</div>
+          <button onClick={() => setNotification(null)} className="ml-4 text-[var(--muted)] hover:text-[var(--text)]">×</button>
+        </div>
+      )}
+    </div>
+  );
+}

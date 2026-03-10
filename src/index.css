@@ -1,0 +1,118 @@
+@import "tailwindcss";
+
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400;1,700&family=JetBrains+Mono:wght@300;400;500;700&family=Inter:wght@300;400;500;600;700&display=swap');
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --font-serif: "Playfair Display", serif;
+}
+
+:root {
+  --bg: #050505;
+  --s1: #0a0a0a;
+  --s2: #111111;
+  --s3: #1a1a1a;
+  --border: rgba(255, 255, 255, 0.08);
+  --amber: #f59e0b;
+  --amber-g: #fbbf24;
+  --amber-dim: rgba(245, 158, 11, 0.08);
+  --cyan: #06b6d4;
+  --red: #ef4444;
+  --green: #10b981;
+  --purple: #8b5cf6;
+  --blue: #3b82f6;
+  --text: #f3f4f6;
+  --muted: #71717a;
+  --dim: #27272a;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  min-height: 100vh;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  letter-spacing: -0.01em;
+}
+
+/* Noise Texture Overlay */
+body::before {
+  content: "";
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 0.03;
+  z-index: 9999;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
+}
+
+body::after {
+  content:'';position:fixed;inset:0;
+  background: 
+    radial-gradient(circle at 0% 0%, rgba(245, 158, 11, 0.05) 0%, transparent 50%),
+    radial-gradient(circle at 100% 100%, rgba(6, 182, 212, 0.03) 0%, transparent 50%);
+  pointer-events:none;z-index:0;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--s3); border-radius: 10px; }
+::-webkit-scrollbar-thumb:hover { background: var(--dim); }
+
+/* Glassmorphism */
+.glass {
+  background: rgba(10, 10, 10, 0.6);
+  backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid var(--border);
+}
+
+.glass-dark {
+  background: rgba(5, 5, 5, 0.8);
+  backdrop-filter: blur(24px);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* Typography */
+.serif { font-family: var(--font-serif); }
+.mono { font-family: var(--font-mono); }
+
+h1, h2, h3, h4 {
+  letter-spacing: -0.03em;
+  font-weight: 600;
+}
+
+.tracking-widest {
+  letter-spacing: 0.2em;
+}
+
+/* Custom Utilities */
+.bento-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 1.5rem;
+}
+
+.data-row {
+  border-bottom: 1px solid var(--border);
+  transition: all 0.2s ease;
+}
+
+.data-row:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/* Animations */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-in {
+  animation: fadeIn 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
